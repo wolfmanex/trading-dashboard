@@ -140,16 +140,13 @@ def get_multi_timeframe_data(ticker: str):
 
 def get_live_price(ticker: str) -> float:
     """
-    Bulletproof live price fetcher abandoning Yahoo.
-    1. CNBC Public Quote API (Highly reliable, bypasses Cloudflare)
-    2. yfinance 1m history fallback
-    3. Alpaca Snapshot fallback
+    Bulletproof live price fetcher using CNBC API with fallback options.
+    Dynamically prioritizes regular vs. extended market hours.
     """
     ticker = ticker.strip().upper()
 
-    # 1. CNBC API (Bypasses Yahoo entirely)
+    # 1. CNBC API (Primary Source)
     try:
-        # Map common Yahoo tickers to CNBC formats
         cnbc_ticker = ticker
         if ticker == "BTC-USD": 
             cnbc_ticker = "BTC.CM="
@@ -170,15 +167,19 @@ def get_live_price(ticker: str) -> float:
             
             if quotes:
                 q = quotes[0]
-                # Check extended hours (Pre/Post) first
-                ext_price = q.get('ExtendedMktQuote', {}).get('last')
                 reg_price = q.get('last')
+                ext_price = q.get('ExtendedMktQuote', {}).get('last')
                 
-                # CNBC returns prices as strings with commas (e.g., "1,234.56")
-                if ext_price and ext_price != "NA":
-                    return float(ext_price.replace(',', ''))
-                elif reg_price and reg_price != "NA":
-                    return float(reg_price.replace(',', ''))
+                # Check current session state (e.g., REG_MKT, PRE_MKT, POST_MKT)
+                market_state = str(q.get('curmktstate', 'REG_MKT')).upper()
+                
+                # 1. If pre-market or after-hours, prioritize the extended quote
+                if "REG" not in market_state and ext_price and ext_price != "NA":
+                    return float(str(ext_price).replace(',', ''))
+                
+                # 2. If regular market hours (or extended missing), use the regular live quote
+                if reg_price and reg_price != "NA":
+                    return float(str(reg_price).replace(',', ''))
     except Exception as e:
         print(f"CNBC API failed for {ticker}: {e}")
 
