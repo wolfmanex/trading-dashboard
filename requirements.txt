@@ -5,3 +5,5 @@ numpy
 plotly
 nltk
 google-genai
+google-generativeai
+alpaca-py

@@ -1,363 +1,299 @@
-import streamlit as st
-import yfinance as yf
 import pandas as pd
-import numpy as np
+import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import nltk
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
-from google import genai
 
-# Download NLTK VADER lexicon quietly if not present
-try:
-    nltk.data.find('sentiment/vader_lexicon.zip')
-except LookupError:
-    nltk.download('vader_lexicon', quiet=True)
+from technical_engine import get_technical_data, get_multi_timeframe_data, get_live_price, add_technical_indicators
+from news_engine import get_ticker_news_sentiment
+from index_filter import get_macro_market_trend
+from llm_engine import synthesize_signals
 
-# ==============================================================================
-# 1. PAGE CONFIGURATION & CUSTOM STYLING
-# ==============================================================================
+
 st.set_page_config(
-    page_title="AI Multi-Signal US Stock Trading Dashboard",
-    page_icon="⚡",
+    page_title="AI Trading Dashboard",
+    page_icon="📈",
     layout="wide"
 )
 
+# Professional Dashboard Custom Styling (Typography & Glow)
 st.markdown("""
-<style>
-    .metric-card {
-        background-color: #1e222d;
-        border-radius: 8px;
-        padding: 15px;
-        border: 1px solid #2a2e39;
-        text-align: center;
-    }
-    .signal-box-bullish {
-        background-color: #132e22;
-        color: #26a69a;
-        padding: 12px;
-        border-radius: 6px;
-        border: 1px solid #26a69a;
-        font-weight: bold;
-        text-align: center;
-    }
-    .signal-box-bearish {
-        background-color: #381e25;
-        color: #ef5350;
-        padding: 12px;
-        border-radius: 6px;
-        border: 1px solid #ef5350;
-        font-weight: bold;
-        text-align: center;
-    }
-    .signal-box-neutral {
-        background-color: #2a2e39;
-        color: #b2b5be;
-        padding: 12px;
-        border-radius: 6px;
-        border: 1px solid #787b86;
-        font-weight: bold;
-        text-align: center;
-    }
-</style>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        
+        .stApp { 
+            background-color: #0B0E14; 
+            color: #E2E8F0; 
+            font-family: 'Inter', sans-serif;
+        }
+        
+        .metric-container {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        @media (max-width: 900px) {
+            .metric-container {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+        @media (max-width: 600px) {
+            .metric-container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .kpi-card {
+            background: #11151F;
+            border: 1px solid #1E2532;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+            transition: all 0.3s ease;
+        }
+        .kpi-card:hover {
+            border-color: #00F0FF;
+            transform: translateY(-3px);
+            box-shadow: 0 8px 24px rgba(0, 240, 255, 0.1);
+        }
+        .kpi-title {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: #718096;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+        .kpi-value {
+            font-size: 1.8rem;
+            font-weight: 700;
+            color: #FFFFFF;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .kpi-badge {
+            font-size: 0.75rem;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        
+        /* Neon glows */
+        .badge-bullish { background: rgba(0, 255, 136, 0.1); color: #00ff88; border: 1px solid #00ff88; box-shadow: 0 0 8px rgba(0,255,136,0.2); }
+        .badge-bearish { background: rgba(255, 0, 85, 0.1); color: #ff0055; border: 1px solid #ff0055; box-shadow: 0 0 8px rgba(255,0,85,0.2); }
+        .badge-neutral { background: rgba(160, 174, 192, 0.1); color: #A0AEC0; border: 1px solid #A0AEC0; }
+        .badge-cyan    { background: rgba(0, 240, 255, 0.1); color: #00F0FF; border: 1px solid #00F0FF; box-shadow: 0 0 8px rgba(0,240,255,0.2); }
+    </style>
 """, unsafe_allow_html=True)
 
-# ==============================================================================
-# 2. SECRETS & SIDEBAR CONTROLS (US STOCK SELECTOR)
-# ==============================================================================
-gemini_api_key = ""
-try:
-    gemini_api_key = st.secrets.get("GEMINI_API_KEY", "")
-except Exception:
-    gemini_api_key = ""
 
-st.sidebar.header("🕹️ Control Panel")
+# Initialize Session State
+if "llm_analysis" not in st.session_state:
+    st.session_state.llm_analysis = None
+if "last_analyzed_ticker" not in st.session_state:
+    st.session_state.last_analyzed_ticker = None
 
-# Popular US Stocks Preset List
-POPULAR_US_STOCKS = [
-    "AMD", "NVDA", "AAPL", "MSFT", "TSLA", "GOOGL", "AMZN", "META",
-    "NFLX", "PLTR", "INTC", "SPY", "QQQ", "IWM", "COIN", "DIS"
-]
 
-stock_mode = st.sidebar.radio("Select Stock Input Method:", ["Popular US Stocks", "Custom Ticker Search"])
+st.title("📈 AI Trading Dashboard")
 
-if stock_mode == "Popular US Stocks":
-    symbol = st.sidebar.selectbox("Choose US Stock:", POPULAR_US_STOCKS, index=0)
+# Sidebar Controls
+st.sidebar.header("Control Panel")
+preset_tickers = ["AMD", "AAPL", "NVDA", "MSFT", "TSLA", "BTC-USD", "EURUSD=X"]
+select_mode = st.sidebar.radio("Ticker Mode", ["Preset List", "Custom Input"])
+
+if select_mode == "Preset List":
+    selected_ticker = st.sidebar.selectbox("Select Asset", preset_tickers)
 else:
-    custom_symbol = st.sidebar.text_input("Enter Any US Ticker Symbol (e.g., BAC, JPM, UNH):", value="AMD")
-    symbol = custom_symbol.strip().upper()
+    selected_ticker = st.sidebar.text_input("Enter Ticker Symbol", "AAPL").upper()
 
-timeframe = st.sidebar.selectbox("Select Timeframe", options=["5m", "15m", "1h", "4h"], index=1)
+# Timeframe Selection for the Chart
+timeframe = st.sidebar.selectbox("Chart Timeframe", ["5m", "15m", "1h", "1d"], index=0)
 
-if not gemini_api_key:
-    st.sidebar.warning("⚠️ Local `GEMINI_API_KEY` not found in `.streamlit/secrets.toml`.")
-else:
-    st.sidebar.success("🔑 Gemini API Key Active")
+# Reset analysis state if user changes the ticker
+if selected_ticker != st.session_state.last_analyzed_ticker:
+    st.session_state.llm_analysis = None
+    st.session_state.last_analyzed_ticker = selected_ticker
 
-# ==============================================================================
-# 3. ENGINES: TECHNICAL, NEWS SENTIMENT, & MARKET TREND
-# ==============================================================================
+# Load Chart & Indicator Data
+with st.spinner(f"Loading market data for {selected_ticker}..."):
+    df_chart = get_technical_data(selected_ticker, timeframe=timeframe)
+    news_sentiment, sentiment_summary = get_ticker_news_sentiment(selected_ticker)
+    macro_trend = get_macro_market_trend()
 
-@st.cache_data(ttl=60)
-def fetch_technical_engine(ticker: str, tf: str) -> pd.DataFrame:
-    """Component 1: Technical Analysis & Charting Data"""
-    t_obj = yf.Ticker(ticker)
-    
-    if tf in ["5m", "15m"]:
-        df = t_obj.history(period="5d", interval=tf)
-    elif tf == "1h":
-        df = t_obj.history(period="1mo", interval="1h")
-    elif tf == "4h":
-        df_1h = t_obj.history(period="3mo", interval="1h")
-        if df_1h.empty: return pd.DataFrame()
-        df = df_1h.resample("4h").agg({
-            "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
-        }).dropna()
-    else:
-        return pd.DataFrame()
-
-    if df.empty: return df
-
-    # Technical Indicators
-    df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
-    df['EMA_21'] = df['Close'].ewm(span=21, adjust=False).mean()
-    
-    # RSI (14)
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / (loss.replace(0, 1e-9))
-    df['RSI_14'] = 100 - (100 / (1 + rs))
-
-    # MACD
-    df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
-    df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = df['EMA_12'] - df['EMA_26']
-    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
-
-    # Cross Markers
-    df['EMA_Cross_Bull'] = (df['EMA_9'] > df['EMA_21']) & (df['EMA_9'].shift(1) <= df['EMA_21'].shift(1))
-    df['EMA_Cross_Bear'] = (df['EMA_9'] < df['EMA_21']) & (df['EMA_9'].shift(1) >= df['EMA_21'].shift(1))
-    
-    return df
-
-@st.cache_data(ttl=300)
-def fetch_news_sentiment(ticker: str):
-    """Component 2: Robust News Sentiment Engine (Handles new & old yfinance formats)"""
-    try:
-        t_obj = yf.Ticker(ticker)
-        news_items = t_obj.news
-        if not news_items:
-            return {"score": 0.0, "label": "NEUTRAL", "headlines": []}
-        
-        sia = SentimentIntensityAnalyzer()
-        scores = []
-        headlines = []
-
-        for item in news_items[:8]:
-            title = ""
-            # Handle new nested yfinance format (v0.2.50+)
-            if isinstance(item, dict):
-                if 'content' in item and isinstance(item['content'], dict):
-                    title = item['content'].get('title', '')
-                elif 'title' in item:
-                    title = item.get('title', '')
-
-            if title:
-                headlines.append(title)
-                score = sia.polarity_scores(title)['compound']
-                scores.append(score)
-
-        if not scores:
-            return {"score": 0.0, "label": "NEUTRAL", "headlines": []}
-
-        avg_score = float(np.mean(scores))
-        label = "BULLISH" if avg_score >= 0.05 else ("BEARISH" if avg_score <= -0.05 else "NEUTRAL")
-        return {"score": avg_score, "label": label, "headlines": headlines}
-    except Exception as e:
-        return {"score": 0.0, "label": "NEUTRAL", "headlines": []}
-
-@st.cache_data(ttl=120)
-def fetch_market_trend():
-    """Component 3: Macro Market Trend Engine (S&P 500 & Nasdaq)"""
-    try:
-        sp500 = yf.Ticker("^GSPC").history(period="2d", interval="1d")
-        nasdaq = yf.Ticker("^IXIC").history(period="2d", interval="1d")
-
-        sp_pct = ((sp500['Close'].iloc[-1] - sp500['Close'].iloc[-2]) / sp500['Close'].iloc[-2]) * 100
-        nas_pct = ((nasdaq['Close'].iloc[-1] - nasdaq['Close'].iloc[-2]) / nasdaq['Close'].iloc[-2]) * 100
-
-        avg_market_change = (sp_pct + nas_pct) / 2
-        trend_label = "BULLISH" if avg_market_change > 0.1 else ("BEARISH" if avg_market_change < -0.1 else "NEUTRAL")
-        return {"sp_pct": sp_pct, "nas_pct": nas_pct, "trend_label": trend_label}
-    except Exception:
-        return {"sp_pct": 0.0, "nas_pct": 0.0, "trend_label": "NEUTRAL"}
-
-# Fetch all 3 data sources
-with st.spinner(f"Aggregating 4-component signal engine for {symbol}..."):
-    tech_df = fetch_technical_engine(symbol, timeframe)
-    news_data = fetch_news_sentiment(symbol)
-    market_data = fetch_market_trend()
-
-if tech_df.empty:
-    st.error(f"Failed to pull ticker data for '{symbol}'. Please verify the ticker symbol and try again.")
+if df_chart.empty:
+    st.error(f"No price data available for {selected_ticker} on timeframe {timeframe}. Check ticker or market hours.")
     st.stop()
 
-# ==============================================================================
-# 4. DASHBOARD KPI & 4-SIGNAL SUMMARY
-# ==============================================================================
-latest = tech_df.iloc[-1]
-prev_close = tech_df.iloc[-2]['Close']
-price_diff = latest['Close'] - prev_close
-pct_diff = (price_diff / prev_close) * 100
+# Helper function to assign badge color classes
+def get_badge_class(text_str: str) -> str:
+    lower_s = str(text_str).lower()
+    if "bullish" in lower_s:
+        return "badge-bullish"
+    elif "bearish" in lower_s:
+        return "badge-bearish"
+    return "badge-neutral"
 
-st.title(f"⚡ {symbol} Multi-Signal Trading Dashboard")
-st.caption(f"Timeframe: {timeframe} | Last Update: {tech_df.index[-1].strftime('%Y-%m-%d %H:%M')}")
+# --- Live Price Logic & Feed Status ---
+raw_live_price = get_live_price(selected_ticker)
 
-# Top Metric Row
-col_p, col_ema, col_rsi, col_macd = st.columns(4)
-col_p.metric("Price", f"${latest['Close']:.2f}", f"{price_diff:+.2f} ({pct_diff:+.2f}%)")
-col_ema.metric("EMA 9 / 21", f"${latest['EMA_9']:.2f}", f"EMA 21: ${latest['EMA_21']:.2f}")
-col_rsi.metric("RSI (14)", f"{latest['RSI_14']:.1f}", "Overbought" if latest['RSI_14'] > 70 else ("Oversold" if latest['RSI_14'] < 30 else "Neutral"))
-col_macd.metric("MACD Hist", f"{latest['MACD_Hist']:+.2f}", "Bullish" if latest['MACD_Hist'] > 0 else "Bearish")
+if raw_live_price > 0 and not pd.isna(raw_live_price):
+    latest_price = raw_live_price
+    price_badge_text = f"LIVE • {selected_ticker}"
+    price_badge_class = "badge-cyan"
+    
+    # Bind live price into df_chart so the Candlestick chart and indicators update
+    df_chart.iloc[-1, df_chart.columns.get_loc('Close')] = latest_price
+    df_chart.iloc[-1, df_chart.columns.get_loc('High')] = max(df_chart['High'].iloc[-1], latest_price)
+    df_chart.iloc[-1, df_chart.columns.get_loc('Low')] = min(df_chart['Low'].iloc[-1], latest_price)
+    
+    # Recalculate indicators so RSI & EMAs on chart match the live price
+    df_chart = add_technical_indicators(df_chart)
+else:
+    latest_price = float(df_chart['Close'].iloc[-1])
+    price_badge_text = f"CLOSED • {selected_ticker}"
+    price_badge_class = "badge-neutral"
+
+rsi_val = df_chart['RSI'].iloc[-1] if 'RSI' in df_chart and not df_chart['RSI'].isna().all() else 0.0
+
+rsi_badge = "badge-neutral"
+rsi_state = "Neutral"
+if rsi_val >= 70:
+    rsi_badge = "badge-bearish"
+    rsi_state = "Overbought"
+elif rsi_val <= 30:
+    rsi_badge = "badge-bullish"
+    rsi_state = "Oversold"
+
+# Render Custom KPI Cards Top Row
+st.markdown(f"""
+<div class="metric-container">
+    <div class="kpi-card">
+        <div class="kpi-title">Price ({timeframe.upper()})</div>
+        <div class="kpi-value">
+            ${latest_price:,.2f}
+            <span class="kpi-badge {price_badge_class}">{price_badge_text}</span>
+        </div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-title">RSI (14)</div>
+        <div class="kpi-value">
+            {rsi_val:.1f}
+            <span class="kpi-badge {rsi_badge}">{rsi_state}</span>
+        </div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-title">News Sentiment</div>
+        <div class="kpi-value" style="font-size: 1.25rem;">
+            {news_sentiment.split(' ')[0]}
+            <span class="kpi-badge {get_badge_class(news_sentiment)}">{news_sentiment}</span>
+        </div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-title">Macro Trend (^GSPC)</div>
+        <div class="kpi-value" style="font-size: 1.25rem;">
+            {macro_trend.split(' ')[0]}
+            <span class="kpi-badge {get_badge_class(macro_trend)}">{macro_trend}</span>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 st.divider()
 
-# 4-Component Summary Row
-st.subheader("🧩 The 4 Signal Components")
-sig1, sig2, sig3, sig4 = st.columns(4)
+# Interactive Candlestick Chart with Volume
+st.subheader(f"📊 Technical Chart ({timeframe}) — {selected_ticker}")
 
-# 1. Technical Signal
-tech_sig = "BULLISH" if (latest['EMA_9'] > latest['EMA_21'] and latest['MACD_Hist'] > 0) else ("BEARISH" if (latest['EMA_9'] < latest['EMA_21'] and latest['MACD_Hist'] < 0) else "NEUTRAL")
-with sig1:
-    st.markdown("**1. Technical Engine**")
-    if tech_sig == "BULLISH": st.markdown('<div class="signal-box-bullish">🟢 BULLISH</div>', unsafe_allow_html=True)
-    elif tech_sig == "BEARISH": st.markdown('<div class="signal-box-bearish">🔴 BEARISH</div>', unsafe_allow_html=True)
-    else: st.markdown('<div class="signal-box-neutral">⚪ NEUTRAL</div>', unsafe_allow_html=True)
+fig = make_subplots(
+    rows=2, cols=1, 
+    shared_xaxes=True, 
+    vertical_spacing=0.03, 
+    row_heights=[0.75, 0.25]
+)
 
-# 2. News Sentiment
-with sig2:
-    st.markdown(f"**2. News Sentiment** ({news_data['score']:+.2f})")
-    n_lbl = news_data['label']
-    if n_lbl == "BULLISH": st.markdown('<div class="signal-box-bullish">🟢 BULLISH</div>', unsafe_allow_html=True)
-    elif n_lbl == "BEARISH": st.markdown('<div class="signal-box-bearish">🔴 BEARISH</div>', unsafe_allow_html=True)
-    else: st.markdown('<div class="signal-box-neutral">⚪ NEUTRAL</div>', unsafe_allow_html=True)
+# Row 1: Candlesticks
+fig.add_trace(go.Candlestick(
+    x=df_chart.index, open=df_chart['Open'], high=df_chart['High'],
+    low=df_chart['Low'], close=df_chart['Close'], name="Price",
+    increasing_line_color='#00ff88', decreasing_line_color='#ff0055'
+), row=1, col=1)
 
-# 3. Market Trend
-with sig3:
-    st.markdown("**3. Market Trend**")
-    m_lbl = market_data['trend_label']
-    if m_lbl == "BULLISH": st.markdown(f'<div class="signal-box-bullish">🟢 BULLISH ({market_data["sp_pct"]:+.1f}%)</div>', unsafe_allow_html=True)
-    elif m_lbl == "BEARISH": st.markdown(f'<div class="signal-box-bearish">🔴 BEARISH ({market_data["sp_pct"]:+.1f}%)</div>', unsafe_allow_html=True)
-    else: st.markdown(f'<div class="signal-box-neutral">⚪ NEUTRAL ({market_data["sp_pct"]:+.1f}%)</div>', unsafe_allow_html=True)
+# Row 1: EMAs
+if 'EMA_9' in df_chart:
+    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['EMA_9'], line=dict(color='#00F0FF', width=1.5), name="EMA 9"), row=1, col=1)
+if 'EMA_21' in df_chart:
+    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['EMA_21'], line=dict(color='#FF007A', width=1.5), name="EMA 21"), row=1, col=1)
 
-# 4. LLM Synthesis Trigger
-with sig4:
-    st.markdown("**4. LLM Synthesis**")
-    st.markdown('<div class="signal-box-neutral">⏳ AWAITING RUN</div>', unsafe_allow_html=True)
+# Row 2: Volume Bar Chart
+colors = ['#00ff88' if row.Close >= row.Open else '#ff0055' for index, row in df_chart.iterrows()]
+fig.add_trace(go.Bar(
+    x=df_chart.index, y=df_chart['Volume'], name="Volume", marker_color=colors, opacity=0.8
+), row=2, col=1)
 
-st.divider()
+# Pro-TradingView Styling
+fig.update_layout(
+    template="plotly_dark",
+    height=650,
+    margin=dict(l=10, r=10, t=20, b=20),
+    xaxis_rangeslider_visible=False,
+    plot_bgcolor='rgba(11, 14, 20, 1)',
+    paper_bgcolor='rgba(11, 14, 20, 1)',
+    showlegend=False
+)
 
-# ==============================================================================
-# 5. PLOTLY CHART
-# ==============================================================================
-def draw_chart(df: pd.DataFrame, symbol_str: str, tf_str: str):
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.8, 0.2])
+# Identify missing dates to remove gaps (weekends, off-hours)
+freq_map = {"5m": "5min", "15m": "15min", "1h": "1h", "1d": "D"}
+# Dvalue dictates the width of the gap in milliseconds (e.g., 5 mins = 300,000 ms)
+dvalue_map = {"5m": 300000, "15m": 900000, "1h": 3600000, "1d": 86400000}
 
-    # Candlestick
-    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"), row=1, col=1)
-
-    # EMAs
-    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_9'], mode='lines', name='EMA 9', line=dict(color='#ff9800', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['EMA_21'], mode='lines', name='EMA 21', line=dict(color='#2196f3', width=1.5)), row=1, col=1)
-
-    # Cross Markers
-    bulls = df[df['EMA_Cross_Bull']]
-    bears = df[df['EMA_Cross_Bear']]
-    if not bulls.empty:
-        fig.add_trace(go.Scatter(x=bulls.index, y=bulls['Low'] * 0.998, mode='markers', name='Bull Cross', marker=dict(symbol='triangle-up', size=11, color='#00e676')), row=1, col=1)
-    if not bears.empty:
-        fig.add_trace(go.Scatter(x=bears.index, y=bears['High'] * 1.002, mode='markers', name='Bear Cross', marker=dict(symbol='triangle-down', size=11, color='#ff5252')), row=1, col=1)
-
-    # Volume Subplot
-    colors = ['#26a69a' if c >= o else '#ef5350' for c, o in zip(df['Close'], df['Open'])]
-    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name="Volume", marker_color=colors), row=2, col=1)
-
-    fig.update_layout(
-        title=f"📊 {symbol_str} ({tf_str}) Chart Analysis",
-        template="plotly_dark", height=560, xaxis_rangeslider_visible=False,
-        margin=dict(l=10, r=10, t=40, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+if timeframe in freq_map:
+    # Build a complete continuous timeline from start to end
+    full_idx = pd.date_range(start=df_chart.index.min(), end=df_chart.index.max(), freq=freq_map[timeframe])
+    # Find the timestamps that are missing from our actual data
+    missing_dt = full_idx.difference(df_chart.index)
+    
+    # Instruct Plotly to hide these specific timestamps
+    fig.update_xaxes(
+        rangebreaks=[dict(values=missing_dt, dvalue=dvalue_map[timeframe])]
     )
-    return fig
 
-chart = draw_chart(tech_df, symbol, timeframe)
-st.plotly_chart(chart, use_container_width=True)
+# Subdued gridlines
+fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#1E2532', row=1, col=1)
+fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#1E2532', row=1, col=1)
+fig.update_xaxes(showgrid=False, row=2, col=1)
+fig.update_yaxes(showgrid=False, row=2, col=1)
 
-# ==============================================================================
-# 6. COMPONENT 4: GEMINI LLM ANALYSIS ENGINE (gemini-flash-lite-latest)
-# ==============================================================================
-st.subheader("🤖 AI Synthesis (4-Factor Model)")
+st.plotly_chart(fig, use_container_width=True)
 
-def request_ai_analysis(df, news, market, ticker, tf_val, api_key):
-    try:
-        client = genai.Client(api_key=api_key)
-        curr = df.iloc[-1]
-        
-        prompt = f"""
-        Act as an elite intraday portfolio manager evaluating {ticker} ({tf_val} timeframe). Synthesize all 4 signals into a final trading recommendation:
-        
-        1. TECHNICAL ENGINE:
-           - Price: ${curr['Close']:.2f}
-           - EMA 9: ${curr['EMA_9']:.2f} | EMA 21: ${curr['EMA_21']:.2f}
-           - RSI (14): {curr['RSI_14']:.2f}
-           - MACD Hist: {curr['MACD_Hist']:.2f}
-           - Tech Signal: {tech_sig}
-        
-        2. NEWS SENTIMENT:
-           - Label: {news['label']} (Compound Score: {news['score']:.2f})
-           - Headlines: {news['headlines'][:3]}
-        
-        3. MARKET TREND CONTEXT:
-           - S&P 500 Daily Move: {market['sp_pct']:+.2f}%
-           - Nasdaq Daily Move: {market['nas_pct']:+.2f}%
-           - Macro Context: {market['trend_label']}
-        
-        INSTRUCTIONS:
-        Synthesize these 4 factors into a 3-part structured trade plan:
-        - **Multi-Factor Confluence:** How well do technicals, news, and market trend align?
-        - **Risk/Reward Level:** Key stop-loss invalidation price and target level.
-        - **Final Trade Signal:** Explicit decision [BUY / SELL / WAIT] with 1-sentence justification.
-        """
-        
-        # Updated model target to gemini-flash-lite-latest
-        res = client.models.generate_content(
-            model='gemini-flash-lite-latest',
-            contents=prompt
+st.divider()
+
+# Callback to run multi-timeframe LLM synthesis cleanly
+def run_synthesis_callback():
+    with st.spinner("Fetching multi-timeframe data & synthesizing signals..."):
+        df_5m, df_4h, df_1d = get_multi_timeframe_data(selected_ticker)
+        st.session_state.llm_analysis = synthesize_signals(
+            ticker=selected_ticker,
+            df_5m=df_5m,
+            df_4h=df_4h,
+            df_1d=df_1d,
+            sentiment_summary=sentiment_summary
         )
-        return res.text
-    except Exception as err:
-        return f"AI Generation Error: {str(err)}"
 
-if st.button("🚀 Synthesize All 4 Signals with Gemini AI", use_container_width=True):
-    if not gemini_api_key:
-        st.error("Missing Gemini API Key. Please add `GEMINI_API_KEY` to `.streamlit/secrets.toml` or your deployment platform's environment variables.")
-    else:
-        with st.spinner(f"Synthesizing Chart Technicals, News Sentiment, and Market Macro for {symbol}..."):
-            ai_out = request_ai_analysis(tech_df, news_data, market_data, symbol, timeframe, gemini_api_key)
-            st.info(ai_out)
+# Section: AI Synthesis Control
+col_title, col_btn = st.columns([3, 1])
 
-# Expanders for News Headlines & Raw Data
-exp_col1, exp_col2 = st.columns(2)
-with exp_col1:
-    with st.expander("📰 Scraped Headlines & Sentiment"):
-        if news_data['headlines']:
-            for h in news_data['headlines']:
-                st.markdown(f"• {h}")
-        else:
-            st.write(f"No recent news headlines available for {symbol}.")
+with col_title:
+    st.subheader("🤖 Multi-Timeframe AI Synthesis")
 
-with exp_col2:
-    with st.expander("📄 Raw Technical Data Table"):
-        st.dataframe(tech_df[['Close', 'EMA_9', 'EMA_21', 'RSI_14', 'MACD_Hist']].sort_index(ascending=False), use_container_width=True)
+with col_btn:
+    btn_label = "🔄 Regenerate Analysis" if st.session_state.llm_analysis else "🚀 Run AI Analysis"
+    st.button(btn_label, on_click=run_synthesis_callback, use_container_width=True)
+
+# Render results
+if st.session_state.llm_analysis:
+    st.markdown(st.session_state.llm_analysis)
+else:
+    st.info("Click 'Run AI Analysis' above to generate a multi-timeframe unified trade decision.")

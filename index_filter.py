@@ -1,40 +1,37 @@
-import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
+import yfinance as yf
 
-class IndexTrendFilter:
-    def __init__(self, tickers=["QQQ", "SPY", "SMH"]):
-        self.tickers = tickers
 
-    def fetch_index_data(self) -> pd.DataFrame:
-        df = yf.download(self.tickers, period="2d", interval="5m", group_by='ticker', prepost=True, progress=False)
-        return df
+def get_macro_market_trend(index_ticker: str = "^GSPC") -> str:
+    """
+    Evaluate macro market regime (e.g., S&P 500 ^GSPC) relative to its 200-day SMA.
+    Returns a human-readable trend string: Bullish, Bearish, or Neutral/Unavailable.
+    """
+    try:
+        df = yf.download(index_ticker, period="1y", interval="1d", progress=False)
 
-    def analyze_trend(self, df: pd.DataFrame, ticker: str) -> int:
-        ticker_data = df[ticker].copy()
-        ticker_data.ta.ema(length=9, append=True)
-        ticker_data.ta.vwap(append=True)
-        ticker_data.dropna(inplace=True)
-        
-        latest = ticker_data.iloc[-1]
-        score = 1 if latest['Close'] > latest.get('VWAP_D', 0) else -1
-        return score
+        # Handle yfinance multi-index column structures if present
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
-    def get_market_bias(self) -> dict:
-        df = self.fetch_index_data()
-        qqq_score = self.analyze_trend(df, "QQQ")
-        spy_score = self.analyze_trend(df, "SPY")
-        smh_score = self.analyze_trend(df, "SMH")
-        
-        total_score = qqq_score + spy_score + smh_score
-        
-        if total_score >= 2: bias = "BULLISH"
-        elif total_score <= -2: bias = "BEARISH"
-        else: bias = "CHOPPY / MIXED"
-            
-        return {
-            "bias": bias,
-            "qqq_score": qqq_score,
-            "spy_score": spy_score,
-            "smh_score": smh_score
-        }
+        if df.empty or len(df) < 200:
+            return "Neutral (Insufficient Data)"
+
+        latest_close = df['Close'].iloc[-1]
+        sma_200 = df['Close'].rolling(window=200).mean().iloc[-1]
+
+        # Handle Series case if close returns as Series
+        if isinstance(latest_close, pd.Series):
+            latest_close = latest_close.item()
+        if isinstance(sma_200, pd.Series):
+            sma_200 = sma_200.item()
+
+        if latest_close > sma_200:
+            percent_above = ((latest_close - sma_200) / sma_200) * 100
+            return f"Bullish (+{percent_above:.1f}% > 200 SMA)"
+        else:
+            percent_below = ((sma_200 - latest_close) / sma_200) * 100
+            return f"Bearish (-{percent_below:.1f}% < 200 SMA)"
+
+    except Exception as e:
+        return f"Neutral (Error: {str(e)})"
