@@ -1,15 +1,16 @@
 import os
-import re
 import requests
 import pandas as pd
 import yfinance as yf
 import streamlit as st
+from datetime import datetime, timedelta
 
 # Safely import Alpaca if installed
 try:
     from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests import StockSnapshotRequest
+    from alpaca.data.requests import StockSnapshotRequest, StockBarsRequest
     from alpaca.data.enums import DataFeed
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     ALPACA_AVAILABLE = True
 except ImportError:
     ALPACA_AVAILABLE = False
@@ -45,19 +46,14 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# Clean bad ticks
+
 def clean_bad_ticks(df: pd.DataFrame, window: int = 14, atr_multiplier: float = 4.0) -> pd.DataFrame:
-    """
-    Dynamically filters out API glitches using Average True Range (ATR).
-    Real crashes move the candle body; glitches are massive, isolated wicks 
-    that far exceed recent baseline volatility.
-    """
-    if df.empty or len(df) < window:
+    """Filters out API glitches using Average True Range (ATR), protecting recent candles."""
+    if df.empty or len(df) < window + 20:
         return df
         
     df_clean = df.copy()
     
-    # 1. Calculate True Range (TR) for volatility baseline
     prev_close = df_clean['Close'].shift(1)
     tr1 = df_clean['High'] - df_clean['Low']
     tr2 = (df_clean['High'] - prev_close).abs()
@@ -77,48 +73,122 @@ def clean_bad_ticks(df: pd.DataFrame, window: int = 14, atr_multiplier: float = 
     fake_upper = (upper_wick > (atr * atr_multiplier)) & (upper_wick > min_move)
     fake_lower = (lower_wick > (atr * atr_multiplier)) & (lower_wick > min_move)
     
+    fake_upper.iloc[-20:] = False
+    fake_lower.iloc[-20:] = False
+    
     return df_clean[~(fake_upper | fake_lower)]
+
 
 @st.cache_data(ttl=300)
 def get_technical_data(ticker: str, timeframe: str = "5m") -> pd.DataFrame:
-    """Fetches market data for a given ticker and timeframe, then calculates technical indicators."""
+    """Fetches chart data using yfinance (Primary), Twelve Data (Secondary), and Alpaca (Tertiary)."""
+    
+    # --- 1. PRIMARY ENGINE: YFINANCE ---
     tf_params = {
-        "5m": {"period": "5d", "interval": "5m"},
+        "5m": {"period": "7d", "interval": "5m"},
         "15m": {"period": "1mo", "interval": "15m"},
         "1h": {"period": "3mo", "interval": "1h"},
         "1d": {"period": "1y", "interval": "1d"},
     }
-
-    params = tf_params.get(timeframe, {"period": "5d", "interval": "5m"})
+    params = tf_params.get(timeframe, {"period": "7d", "interval": "5m"})
 
     try:
         t = yf.Ticker(ticker)
+        # prepost=True ensures extended hours are pulled into the charts
         df = t.history(period=params["period"], interval=params["interval"], prepost=True)
 
         if not df.empty:
-            # Handle Yahoo's MultiIndex column format
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             
-            # Ensure index is datetime without timezone for clean Plotly rendering
-            df.index = pd.to_datetime(df.index).tz_localize(None)
+            if str(df.index.tz) == 'UTC':
+                df.index = df.index.tz_convert('US/Eastern').tz_localize(None)
+            elif df.index.tz is not None:
+                try:
+                    df.index = df.index.tz_convert('US/Eastern').tz_localize(None)
+                except Exception:
+                    df.index = df.index.tz_localize(None)
+            else:
+                df.index = pd.to_datetime(df.index)
             
-            # --- SCRUB BAD API TICKS HERE ---
             df = clean_bad_ticks(df)
-            
-            # Calculate technical indicators on the clean data
             df = add_technical_indicators(df)
             return df
             
     except Exception as e:
-        print(f"Error fetching technical data for {ticker} ({timeframe}): {e}")
+        print(f"YFinance failed for {ticker} ({timeframe}): {e}. Trying Twelve Data...")
+
+    # --- 2. SECONDARY ENGINE: TWELVE DATA ---
+    twelve_key = st.secrets.get("TWELVEDATA_API_KEY") or os.getenv("TWELVEDATA_API_KEY")
+    if twelve_key:
+        try:
+            td_ticker = ticker.replace("-", "/") 
+            twelve_tf_map = {"5m": "5min", "15m": "15min", "1h": "1h", "1d": "1day"}
+            interval = twelve_tf_map.get(timeframe, "5min")
+            
+            url = f"https://api.twelvedata.com/time_series?symbol={td_ticker}&interval={interval}&apikey={twelve_key}&outputsize=1000&format=JSON&timezone=America/New_York&prepost=true"
+            resp = requests.get(url, timeout=10)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if 'values' in data:
+                    df = pd.DataFrame(data['values'])
+                    df = df.iloc[::-1].copy()
+                    df['datetime'] = pd.to_datetime(df['datetime'])
+                    df.set_index('datetime', inplace=True)
+                    df.index.name = 'Date'
+                    
+                    df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+                    df = df.astype(float)
+                    
+                    df = clean_bad_ticks(df)
+                    df = add_technical_indicators(df)
+                    return df
+        except Exception as e:
+            print(f"Twelve Data failed for {ticker}: {e}. Trying Alpaca...")
+
+    # --- 3. TERTIARY ENGINE: ALPACA ---
+    if ALPACA_AVAILABLE:
+        alpaca_key = st.secrets.get("ALPACA_API_KEY") or os.getenv("ALPACA_API_KEY")
+        alpaca_secret = st.secrets.get("ALPACA_API_SECRET") or os.getenv("ALPACA_API_SECRET")
+        
+        if alpaca_key and alpaca_secret:
+            try:
+                client = StockHistoricalDataClient(alpaca_key, alpaca_secret)
+                tf_map = {
+                    "5m": (TimeFrame(5, TimeFrameUnit.Minute), 7),
+                    "15m": (TimeFrame(15, TimeFrameUnit.Minute), 30),
+                    "1h": (TimeFrame(1, TimeFrameUnit.Hour), 90),
+                    "1d": (TimeFrame(1, TimeFrameUnit.Day), 365)
+                }
+                alpaca_tf, days_back = tf_map.get(timeframe, (TimeFrame(5, TimeFrameUnit.Minute), 7))
+                
+                start_date = datetime.utcnow() - timedelta(days=days_back)
+                req = StockBarsRequest(
+                    symbol_or_symbols=ticker,
+                    timeframe=alpaca_tf,
+                    start=start_date,
+                    feed=DataFeed.IEX 
+                )
+                bars = client.get_stock_bars(req)
+                
+                if bars and ticker in bars.data:
+                    df = bars.df.loc[ticker].copy()
+                    df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+                    df.index = df.index.tz_convert('US/Eastern').tz_localize(None)
+                    
+                    df = clean_bad_ticks(df)
+                    df = add_technical_indicators(df)
+                    return df
+            except Exception as e:
+                print(f"Alpaca fallback failed for {ticker}: {e}")
 
     return pd.DataFrame()
 
 
 @st.cache_data(ttl=600)
 def get_multi_timeframe_data(ticker: str):
-    """Fetches 5m, 4h (resampled from 1h), and 1d data for LLM multi-timeframe analysis."""
+    """Fetches 5m, 4h (resampled from 1h), and 1d data for LLM analysis."""
     df_5m = get_technical_data(ticker, timeframe="5m")
     df_1h = get_technical_data(ticker, timeframe="1h")
     df_1d = get_technical_data(ticker, timeframe="1d")
@@ -139,13 +209,23 @@ def get_multi_timeframe_data(ticker: str):
 
 
 def get_live_price(ticker: str) -> float:
-    """
-    Bulletproof live price fetcher using CNBC API with fallback options.
-    Dynamically prioritizes regular vs. extended market hours.
-    """
+    """Fetches live price using yfinance (Primary), CNBC (Secondary), and Twelve Data (Tertiary)."""
     ticker = ticker.strip().upper()
 
-    # 1. CNBC API (Primary Source)
+    # 1. YFINANCE (Primary)
+    try:
+        t = yf.Ticker(ticker)
+        df_1m = t.history(period="1d", interval="1m", prepost=True)
+        if not df_1m.empty:
+            last_close = df_1m['Close'].iloc[-1]
+            if isinstance(last_close, pd.Series):
+                last_close = last_close.iloc[-1]
+            if not pd.isna(last_close) and last_close > 0:
+                return float(last_close)
+    except Exception as e:
+        print(f"yfinance live price failed for {ticker}: {e}")
+
+    # 2. CNBC API (Secondary)
     try:
         cnbc_ticker = ticker
         if ticker == "BTC-USD": 
@@ -156,9 +236,7 @@ def get_live_price(ticker: str) -> float:
             cnbc_ticker = ticker.replace("-", "")
 
         url = f"https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?symbols={cnbc_ticker}&requestMethod=itv&noform=1&fund=1&exthrs=1&output=json&events=1"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         
         resp = requests.get(url, headers=headers, timeout=5)
         if resp.status_code == 200:
@@ -169,47 +247,29 @@ def get_live_price(ticker: str) -> float:
                 q = quotes[0]
                 reg_price = q.get('last')
                 ext_price = q.get('ExtendedMktQuote', {}).get('last')
-                
-                # Check current session state (e.g., REG_MKT, PRE_MKT, POST_MKT)
                 market_state = str(q.get('curmktstate', 'REG_MKT')).upper()
                 
-                # 1. If pre-market or after-hours, prioritize the extended quote
                 if "REG" not in market_state and ext_price and ext_price != "NA":
                     return float(str(ext_price).replace(',', ''))
                 
-                # 2. If regular market hours (or extended missing), use the regular live quote
                 if reg_price and reg_price != "NA":
                     return float(str(reg_price).replace(',', ''))
     except Exception as e:
         print(f"CNBC API failed for {ticker}: {e}")
 
-    # 2. yfinance 1-Minute History Fallback
+    # 3. TWELVE DATA API (Tertiary)
     try:
-        t = yf.Ticker(ticker)
-        df_1m = t.history(period="1d", interval="1m", prepost=True)
-        if not df_1m.empty:
-            last_close = df_1m['Close'].iloc[-1]
-            if isinstance(last_close, pd.Series):
-                last_close = last_close.iloc[-1]
-            if not pd.isna(last_close) and last_close > 0:
-                return float(last_close)
-    except Exception:
-        pass
-
-    # 3. Alpaca Snapshot Fallback
-    if "-" not in ticker and "=" not in ticker and ALPACA_AVAILABLE:
-        try:
-            api_key = st.secrets.get("ALPACA_API_KEY") or os.getenv("ALPACA_API_KEY")
-            api_secret = st.secrets.get("ALPACA_API_SECRET") or os.getenv("ALPACA_API_SECRET")
-            if api_key and api_secret:
-                client = StockHistoricalDataClient(api_key, api_secret)
-                req = StockSnapshotRequest(symbol_or_symbols=ticker, feed=DataFeed.IEX)
-                res = client.get_stock_snapshot(req)
-                if ticker in res:
-                    snapshot = res[ticker]
-                    if snapshot.latest_trade and snapshot.latest_trade.price > 0:
-                        return float(snapshot.latest_trade.price)
-        except Exception:
-            pass
+        twelve_key = st.secrets.get("TWELVEDATA_API_KEY") or os.getenv("TWELVEDATA_API_KEY")
+        if twelve_key:
+            td_ticker = ticker.replace("-", "/")
+            url = f"https://api.twelvedata.com/price?symbol={td_ticker}&apikey={twelve_key}&prepost=true"
+            
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "price" in data:
+                    return float(data["price"])
+    except Exception as e:
+        print(f"Twelve Data live price failed for {ticker}: {e}")
 
     return 0.0
