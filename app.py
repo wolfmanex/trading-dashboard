@@ -6,7 +6,7 @@ from plotly.subplots import make_subplots
 from technical_engine import get_technical_data, get_multi_timeframe_data, get_live_price, add_technical_indicators
 from news_engine import get_ticker_news_sentiment
 from index_filter import get_macro_market_trend
-from llm_engine import synthesize_signals
+from llm_engine import generate_ai_analysis, synthesize_signals
 
 
 st.set_page_config(
@@ -102,7 +102,7 @@ st.title("📈 AI Trading Dashboard")
 
 # Sidebar Controls
 st.sidebar.header("Control Panel")
-preset_tickers = ["AMD", "AAPL", "NVDA", "MSFT", "TSLA", "BTC-USD", "EURUSD=X"]
+preset_tickers = ["AMD", "QCOM", "AAPL", "NVDA", "MSFT", "TSLA", "BTC-USD", "EURUSD=X"]
 select_mode = st.sidebar.radio("Ticker Mode", ["Preset List", "Custom Input"])
 
 if select_mode == "Preset List":
@@ -124,7 +124,7 @@ with st.spinner(f"Loading market data for {selected_ticker}..."):
     news_sentiment, sentiment_summary = get_ticker_news_sentiment(selected_ticker)
     macro_trend = get_macro_market_trend()
 
-if df_chart.empty:
+if df_chart is None or df_chart.empty:
     st.error(f"No price data available for {selected_ticker} on timeframe {timeframe}. Check ticker or market hours.")
     st.stop()
 
@@ -246,16 +246,12 @@ fig.update_layout(
 
 # Identify missing dates to remove gaps (weekends, off-hours)
 freq_map = {"5m": "5min", "15m": "15min", "1h": "1h", "1d": "D"}
-# Dvalue dictates the width of the gap in milliseconds (e.g., 5 mins = 300,000 ms)
 dvalue_map = {"5m": 300000, "15m": 900000, "1h": 3600000, "1d": 86400000}
 
 if timeframe in freq_map:
-    # Build a complete continuous timeline from start to end
     full_idx = pd.date_range(start=df_chart.index.min(), end=df_chart.index.max(), freq=freq_map[timeframe])
-    # Find the timestamps that are missing from our actual data
     missing_dt = full_idx.difference(df_chart.index)
     
-    # Instruct Plotly to hide these specific timestamps
     fig.update_xaxes(
         rangebreaks=[dict(values=missing_dt, dvalue=dvalue_map[timeframe])]
     )
@@ -292,8 +288,58 @@ with col_btn:
     btn_label = "🔄 Regenerate Analysis" if st.session_state.llm_analysis else "🚀 Run AI Analysis"
     st.button(btn_label, on_click=run_synthesis_callback, use_container_width=True)
 
-# Render results
+# Render Multi-Factor Deep AI Results
 if st.session_state.llm_analysis:
-    st.markdown(st.session_state.llm_analysis)
+    res = st.session_state.llm_analysis
+    
+    if isinstance(res, dict):
+        signal = res.get('signal', 'HOLD')
+        color = "🟢" if signal == "BUY" else ("🔴" if signal == "SELL" else "🟡")
+        confidence = int(res.get('confidence', 0) * 100)
+        
+        # --- Top Level Signal Summary Banner ---
+        st.subheader(f"{color} Signal: {signal}  |  Confidence: {confidence}%  |  Alignment: `{res.get('timeframe_confluence', 'N/A')}`")
+        
+        # --- Institutional Execution Plan Card ---
+        plan = res.get('execution_plan', {})
+        st.markdown("### 🎯 Trade Execution Plan")
+        
+        p_col1, p_col2, p_col3, p_col4 = st.columns(4)
+        p_col1.metric("Target Entry Zone", str(plan.get('entry_zone', 'N/A')))
+        p_col2.metric("Take Profit Target", f"${plan.get('take_profit', 0.0):.2f}" if isinstance(plan.get('take_profit'), (int, float)) else str(plan.get('take_profit')))
+        p_col3.metric("Stop Loss Level", f"${plan.get('stop_loss', 0.0):.2f}" if isinstance(plan.get('stop_loss'), (int, float)) else str(plan.get('stop_loss')))
+        p_col4.metric("Risk / Reward Ratio", str(plan.get('risk_reward_ratio', 'N/A')))
+        
+        # --- Multi-Factor Breakdown Cards ---
+        st.markdown("### 🔬 Multi-Factor Analysis Breakdown")
+        
+        tab_tech, tab_macro, tab_news = st.tabs([
+            "📊 Technical Structure (Multi-Timeframe)", 
+            "🌐 Macro Regime (SPY & VIX)", 
+            "📰 Catalysts & Headlines"
+        ])
+        
+        with tab_tech:
+            st.markdown(f"**Higher Timeframe (Daily/4H Trend):**")
+            st.write(res.get('higher_tf_breakdown', 'N/A'))
+            st.markdown(f"**Intraday Setup (5m Momentum):**")
+            st.write(res.get('intraday_tf_breakdown', 'N/A'))
+            
+            s_col1, s_col2 = st.columns(2)
+            s_col1.metric("Key Support Level", f"${plan.get('key_support', 0.0):.2f}" if isinstance(plan.get('key_support'), (int, float)) else str(plan.get('key_support')))
+            s_col2.metric("Key Resistance Level", f"${plan.get('key_resistance', 0.0):.2f}" if isinstance(plan.get('key_resistance'), (int, float)) else str(plan.get('key_resistance')))
+
+        with tab_macro:
+            st.write(res.get('macro_analysis', 'N/A'))
+
+        with tab_news:
+            st.write(res.get('news_catalyst_analysis', 'N/A'))
+
+        # --- Comprehensive Thesis ---
+        with st.expander("📝 View Complete AI Thesis & Strategic Commentary", expanded=True):
+            st.write(res.get('detailed_reasoning', 'N/A'))
+
+    else:
+        st.markdown(res)
 else:
     st.info("Click 'Run AI Analysis' above to generate a multi-timeframe unified trade decision.")
