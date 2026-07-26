@@ -7,6 +7,8 @@ from technical_engine import get_technical_data, get_multi_timeframe_data, get_l
 from news_engine import get_ticker_news_sentiment
 from index_filter import get_macro_market_trend
 from llm_engine import generate_ai_analysis, synthesize_signals
+from event_engine import get_upcoming_events
+from options_engine import get_options_sentiment
 
 
 st.set_page_config(
@@ -100,29 +102,45 @@ if "last_analyzed_ticker" not in st.session_state:
 
 st.title("📈 AI Trading Dashboard")
 
-# Sidebar Controls
-st.sidebar.header("Control Panel")
+# ==============================================================================
+# SIDEBAR CONTROLS
+# ==============================================================================
+st.sidebar.title("Trading Dashboard Controls")
+
+# 1. Strategy Horizon Switcher
+analysis_mode = st.sidebar.radio(
+    "Select Horizon Strategy:",
+    ["Intra-Day (Scalp/Day Trade)", "Weekly (Swing/Position)"]
+)
+
+# 2. Asset Selection (Preset vs Custom Input)
 preset_tickers = ["AMD", "QCOM", "AAPL", "NVDA", "MSFT", "TSLA", "BTC-USD", "EURUSD=X"]
 select_mode = st.sidebar.radio("Ticker Mode", ["Preset List", "Custom Input"])
 
 if select_mode == "Preset List":
     selected_ticker = st.sidebar.selectbox("Select Asset", preset_tickers)
 else:
-    selected_ticker = st.sidebar.text_input("Enter Ticker Symbol", "AAPL").upper()
+    selected_ticker = st.sidebar.text_input("Enter Ticker Symbol", "AMD").upper()
 
-# Timeframe Selection for the Chart
-timeframe = st.sidebar.selectbox("Chart Timeframe", ["5m", "15m", "1h", "1d"], index=0)
+# 3. Chart Timeframe Selection (Automatically defaults based on strategy mode)
+default_tf_index = 0 if "Intra-Day" in analysis_mode else 3
+timeframe = st.sidebar.selectbox(
+    "Chart Timeframe", 
+    ["5m", "15m", "1h", "1d", "1w"], 
+    index=default_tf_index
+)
 
 # Reset analysis state if user changes the ticker
 if selected_ticker != st.session_state.last_analyzed_ticker:
     st.session_state.llm_analysis = None
     st.session_state.last_analyzed_ticker = selected_ticker
 
-# Load Chart & Indicator Data
-with st.spinner(f"Loading market data for {selected_ticker}..."):
+# Load Chart, Sentiment, Macro Trend & Upcoming Events Data
+with st.spinner(f"Loading market data & events for {selected_ticker}..."):
     df_chart = get_technical_data(selected_ticker, timeframe=timeframe)
     news_sentiment, sentiment_summary = get_ticker_news_sentiment(selected_ticker)
     macro_trend = get_macro_market_trend()
+    event_data = get_upcoming_events(selected_ticker)
 
 if df_chart is None or df_chart.empty:
     st.error(f"No price data available for {selected_ticker} on timeframe {timeframe}. Check ticker or market hours.")
@@ -205,7 +223,7 @@ st.markdown(f"""
 st.divider()
 
 # Interactive Candlestick Chart with Volume
-st.subheader(f"📊 Technical Chart ({timeframe}) — {selected_ticker}")
+st.subheader(f"📊 Technical Chart ({timeframe}) — {selected_ticker} [{analysis_mode}]")
 
 fig = make_subplots(
     rows=2, cols=1, 
@@ -244,9 +262,9 @@ fig.update_layout(
     showlegend=False
 )
 
-# Identify missing dates to remove gaps (weekends, off-hours)
-freq_map = {"5m": "5min", "15m": "15min", "1h": "1h", "1d": "D"}
-dvalue_map = {"5m": 300000, "15m": 900000, "1h": 3600000, "1d": 86400000}
+# Identify missing dates to remove gaps (ONLY for Intraday timeframes)
+freq_map = {"5m": "5min", "15m": "15min", "1h": "1h"}
+dvalue_map = {"5m": 300000, "15m": 900000, "1h": 3600000}
 
 if timeframe in freq_map:
     full_idx = pd.date_range(start=df_chart.index.min(), end=df_chart.index.max(), freq=freq_map[timeframe])
@@ -264,18 +282,44 @@ fig.update_yaxes(showgrid=False, row=2, col=1)
 
 st.plotly_chart(fig, use_container_width=True)
 
+# ==============================================================================
+# UPCOMING EVENTS & MACRO CATALYST SECTION
+# ==============================================================================
+st.divider()
+st.subheader("🌐 Catalysts & Macro Economic Environment")
+
+col_e1, col_e2, col_e3 = st.columns(3)
+with col_e1:
+    st.metric("Upcoming Earnings Date", event_data.get("earnings_date", "N/A"))
+with col_e2:
+    st.metric("Market Volatility (VIX)", f"{event_data.get('macro_vix', 0.0)}")
+with col_e3:
+    st.metric("10Y Treasury Yield (^TNX)", f"{event_data.get('macro_tnx', 0.0)}%")
+
+if event_data.get("news_headlines"):
+    with st.expander("📰 View Recent Catalyst Headlines", expanded=False):
+        for headline in event_data["news_headlines"]:
+            st.write(headline)
+
 st.divider()
 
-# Callback to run multi-timeframe LLM synthesis cleanly
+# Callback to run multi-timeframe LLM synthesis cleanly with Macro Context
 def run_synthesis_callback():
-    with st.spinner("Fetching multi-timeframe data & synthesizing signals..."):
+    with st.spinner("Fetching multi-horizon data, options OI & macro signals..."):
         df_5m, df_4h, df_1d = get_multi_timeframe_data(selected_ticker)
+        df_1w = get_technical_data(selected_ticker, timeframe="1w")
+        options_data = get_options_sentiment(selected_ticker)
+
         st.session_state.llm_analysis = synthesize_signals(
             ticker=selected_ticker,
             df_5m=df_5m,
             df_4h=df_4h,
             df_1d=df_1d,
-            sentiment_summary=sentiment_summary
+            df_1w=df_1w,
+            sentiment_summary=sentiment_summary,
+            event_data=event_data,
+            options_data=options_data,
+            analysis_mode=analysis_mode,
         )
 
 # Section: AI Synthesis Control
@@ -288,58 +332,111 @@ with col_btn:
     btn_label = "🔄 Regenerate Analysis" if st.session_state.llm_analysis else "🚀 Run AI Analysis"
     st.button(btn_label, on_click=run_synthesis_callback, use_container_width=True)
 
+# Helper to prevent Streamlit from treating dollar signs in AI text as LaTeX
+def sanitize_ai_text(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    # Escapes unescaped $ signs so Streamlit won't parse them as LaTeX math formulas
+    return text.replace("$", r"\$")
+
 # Render Multi-Factor Deep AI Results
 if st.session_state.llm_analysis:
     res = st.session_state.llm_analysis
     
     if isinstance(res, dict):
-        signal = res.get('signal', 'HOLD')
-        color = "🟢" if signal == "BUY" else ("🔴" if signal == "SELL" else "🟡")
-        confidence = int(res.get('confidence', 0) * 100)
+        signal = str(res.get('signal', 'HOLD')).upper()
+        confidence = int(res.get('confidence', 0) * 100) if res.get('confidence', 0) <= 1 else int(res.get('confidence', 0))
+        alignment = res.get('timeframe_confluence', 'N/A')
         
+        # Color coding for Signal Banner
+        if signal == "BUY":
+            badge_class = "badge-bullish"
+            glow_color = "rgba(0, 255, 136, 0.15)"
+            border_color = "#00ff88"
+            icon = "🟢"
+        elif signal == "SELL":
+            badge_class = "badge-bearish"
+            glow_color = "rgba(255, 0, 85, 0.15)"
+            border_color = "#ff0055"
+            icon = "🔴"
+        else:
+            badge_class = "badge-neutral"
+            glow_color = "rgba(160, 174, 192, 0.15)"
+            border_color = "#A0AEC0"
+            icon = "🟡"
+
         # --- Top Level Signal Summary Banner ---
-        st.subheader(f"{color} Signal: {signal}  |  Confidence: {confidence}%  |  Alignment: `{res.get('timeframe_confluence', 'N/A')}`")
+        st.markdown(f"""
+        <div style="background: {glow_color}; border: 1px solid {border_color}; border-radius: 12px; padding: 18px 24px; margin-bottom: 25px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                <div style="font-size: 1.4rem; font-weight: 700; color: #FFFFFF;">
+                    {icon} Signal: <span style="color: {border_color};">{signal}</span> 
+                    <span style="font-size: 1rem; color: #A0AEC0; font-weight: 400; margin-left: 15px;">Confidence: <strong>{confidence}%</strong></span>
+                </div>
+                <div>
+                    <span class="kpi-badge {badge_class}" style="font-size: 0.85rem; padding: 6px 14px;">Alignment: {alignment}</span>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
         
-        # --- Institutional Execution Plan Card ---
+        # --- Institutional Execution Plan Cards ---
         plan = res.get('execution_plan', {})
         st.markdown("### 🎯 Trade Execution Plan")
         
-        p_col1, p_col2, p_col3, p_col4 = st.columns(4)
-        p_col1.metric("Target Entry Zone", str(plan.get('entry_zone', 'N/A')))
-        p_col2.metric("Take Profit Target", f"${plan.get('take_profit', 0.0):.2f}" if isinstance(plan.get('take_profit'), (int, float)) else str(plan.get('take_profit')))
-        p_col3.metric("Stop Loss Level", f"${plan.get('stop_loss', 0.0):.2f}" if isinstance(plan.get('stop_loss'), (int, float)) else str(plan.get('stop_loss')))
-        p_col4.metric("Risk / Reward Ratio", str(plan.get('risk_reward_ratio', 'N/A')))
+        tp_val = plan.get('take_profit', 0.0)
+        sl_val = plan.get('stop_loss', 0.0)
         
-        # --- Multi-Factor Breakdown Cards ---
+        p_col1, p_col2, p_col3, p_col4 = st.columns(4)
+        with p_col1:
+            st.metric("Target Entry Zone", f"${plan.get('entry_zone', 'N/A')}")
+        with p_col2:
+            st.metric("Take Profit Target", f"${tp_val:.2f}" if isinstance(tp_val, (int, float)) else str(tp_val))
+        with p_col3:
+            st.metric("Stop Loss Level", f"${sl_val:.2f}" if isinstance(sl_val, (int, float)) else str(sl_val))
+        with p_col4:
+            st.metric("Risk / Reward Ratio", str(plan.get('risk_reward_ratio', 'N/A')))
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        # --- Multi-Factor Breakdown Section ---
         st.markdown("### 🔬 Multi-Factor Analysis Breakdown")
         
         tab_tech, tab_macro, tab_news = st.tabs([
-            "📊 Technical Structure (Multi-Timeframe)", 
-            "🌐 Macro Regime (SPY & VIX)", 
+            "📊 Technical Structure", 
+            "🌐 Macro Regime & Risk", 
             "📰 Catalysts & Headlines"
         ])
         
         with tab_tech:
-            st.markdown(f"**Higher Timeframe (Daily/4H Trend):**")
-            st.write(res.get('higher_tf_breakdown', 'N/A'))
-            st.markdown(f"**Intraday Setup (5m Momentum):**")
-            st.write(res.get('intraday_tf_breakdown', 'N/A'))
+            t_col1, t_col2 = st.columns(2)
+            with t_col1:
+                st.markdown("**Higher Timeframe (Macro Trend):**")
+                st.markdown(sanitize_ai_text(res.get('higher_tf_breakdown', 'N/A')))
+            with t_col2:
+                st.markdown("**Intraday Setup (Trigger):**")
+                st.markdown(sanitize_ai_text(res.get('intraday_tf_breakdown', 'N/A')))
             
+            st.markdown("---")
             s_col1, s_col2 = st.columns(2)
-            s_col1.metric("Key Support Level", f"${plan.get('key_support', 0.0):.2f}" if isinstance(plan.get('key_support'), (int, float)) else str(plan.get('key_support')))
-            s_col2.metric("Key Resistance Level", f"${plan.get('key_resistance', 0.0):.2f}" if isinstance(plan.get('key_resistance'), (int, float)) else str(plan.get('key_resistance')))
+            supp_val = plan.get('key_support', 0.0)
+            rest_val = plan.get('key_resistance', 0.0)
+            s_col1.metric("Key Technical Support", f"${supp_val:.2f}" if isinstance(supp_val, (int, float)) else str(supp_val))
+            s_col2.metric("Key Technical Resistance", f"${rest_val:.2f}" if isinstance(rest_val, (int, float)) else str(rest_val))
 
         with tab_macro:
-            st.write(res.get('macro_analysis', 'N/A'))
+            st.markdown(sanitize_ai_text(res.get('macro_analysis', 'N/A')))
 
         with tab_news:
-            st.write(res.get('news_catalyst_analysis', 'N/A'))
+            st.markdown(sanitize_ai_text(res.get('news_catalyst_analysis', 'N/A')))
+
+        st.markdown("<br>", unsafe_allow_html=True)
 
         # --- Comprehensive Thesis ---
         with st.expander("📝 View Complete AI Thesis & Strategic Commentary", expanded=True):
-            st.write(res.get('detailed_reasoning', 'N/A'))
+            st.markdown(sanitize_ai_text(res.get('detailed_reasoning', 'N/A')))
 
     else:
-        st.markdown(res)
+        st.markdown(sanitize_ai_text(str(res)))
 else:
     st.info("Click 'Run AI Analysis' above to generate a multi-timeframe unified trade decision.")

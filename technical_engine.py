@@ -81,7 +81,7 @@ def clean_bad_ticks(df: pd.DataFrame, window: int = 14, atr_multiplier: float = 
 
 @st.cache_data(ttl=300)
 def get_technical_data(ticker: str, timeframe: str = "5m") -> pd.DataFrame:
-    """Fetches chart data using yfinance (Primary), Twelve Data (Secondary), and Alpaca (Tertiary)."""
+    """Fetches chart data supporting Intraday (5m, 15m, 1h) and Swing/Weekly (1d, 1w) timeframes."""
     
     # --- 1. PRIMARY ENGINE: YFINANCE ---
     tf_params = {
@@ -89,12 +89,12 @@ def get_technical_data(ticker: str, timeframe: str = "5m") -> pd.DataFrame:
         "15m": {"period": "1mo", "interval": "15m"},
         "1h": {"period": "3mo", "interval": "1h"},
         "1d": {"period": "1y", "interval": "1d"},
+        "1w": {"period": "5y", "interval": "1wk"},  # <--- Added Weekly Support
     }
     params = tf_params.get(timeframe, {"period": "7d", "interval": "5m"})
 
     try:
         t = yf.Ticker(ticker)
-        # prepost=True ensures extended hours are pulled into the charts
         df = t.history(period=params["period"], interval=params["interval"], prepost=True)
 
         if not df.empty:
@@ -123,7 +123,13 @@ def get_technical_data(ticker: str, timeframe: str = "5m") -> pd.DataFrame:
     if twelve_key:
         try:
             td_ticker = ticker.replace("-", "/") 
-            twelve_tf_map = {"5m": "5min", "15m": "15min", "1h": "1h", "1d": "1day"}
+            twelve_tf_map = {
+                "5m": "5min", 
+                "15m": "15min", 
+                "1h": "1h", 
+                "1d": "1day", 
+                "1w": "1week"  # <--- Added Weekly Support
+            }
             interval = twelve_tf_map.get(timeframe, "5min")
             
             url = f"https://api.twelvedata.com/time_series?symbol={td_ticker}&interval={interval}&apikey={twelve_key}&outputsize=1000&format=JSON&timezone=America/New_York&prepost=true"
@@ -159,7 +165,8 @@ def get_technical_data(ticker: str, timeframe: str = "5m") -> pd.DataFrame:
                     "5m": (TimeFrame(5, TimeFrameUnit.Minute), 7),
                     "15m": (TimeFrame(15, TimeFrameUnit.Minute), 30),
                     "1h": (TimeFrame(1, TimeFrameUnit.Hour), 90),
-                    "1d": (TimeFrame(1, TimeFrameUnit.Day), 365)
+                    "1d": (TimeFrame(1, TimeFrameUnit.Day), 365),
+                    "1w": (TimeFrame(1, TimeFrameUnit.Week), 730)  # <--- Added Weekly Support
                 }
                 alpaca_tf, days_back = tf_map.get(timeframe, (TimeFrame(5, TimeFrameUnit.Minute), 7))
                 
