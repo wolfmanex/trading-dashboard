@@ -9,6 +9,8 @@ from index_filter import get_macro_market_trend
 from llm_engine import generate_ai_analysis, synthesize_signals
 from event_engine import get_upcoming_events
 from options_engine import get_options_sentiment
+from swing_engine import get_swing_metrics
+from intraday_engine import get_intraday_metrics
 
 
 st.set_page_config(
@@ -309,6 +311,8 @@ def run_synthesis_callback():
         df_5m, df_4h, df_1d = get_multi_timeframe_data(selected_ticker)
         df_1w = get_technical_data(selected_ticker, timeframe="1w")
         options_data = get_options_sentiment(selected_ticker)
+        swing_metrics = get_swing_metrics(selected_ticker)
+        intraday_metrics = get_intraday_metrics(selected_ticker)
 
         st.session_state.llm_analysis = synthesize_signals(
             ticker=selected_ticker,
@@ -319,6 +323,8 @@ def run_synthesis_callback():
             sentiment_summary=sentiment_summary,
             event_data=event_data,
             options_data=options_data,
+            swing_metrics=swing_metrics,
+            intraday_metrics=intraday_metrics,
             analysis_mode=analysis_mode,
         )
 
@@ -380,13 +386,16 @@ if st.session_state.llm_analysis:
         </div>
         """, unsafe_allow_html=True)
         
-        # --- Institutional Execution Plan Cards ---
+        ## --- Institutional Execution Plan Cards ---
         plan = res.get('execution_plan', {})
         st.markdown("### 🎯 Trade Execution Plan")
         
         tp_val = plan.get('take_profit', 0.0)
         sl_val = plan.get('stop_loss', 0.0)
+        up_limit = plan.get('swing_upper_limit', 'N/A')
+        low_limit = plan.get('swing_lower_limit', 'N/A')
         
+        # Row 1: Core Trade Targets
         p_col1, p_col2, p_col3, p_col4 = st.columns(4)
         with p_col1:
             st.metric("Target Entry Zone", f"${plan.get('entry_zone', 'N/A')}")
@@ -396,6 +405,13 @@ if st.session_state.llm_analysis:
             st.metric("Stop Loss Level", f"${sl_val:.2f}" if isinstance(sl_val, (int, float)) else str(sl_val))
         with p_col4:
             st.metric("Risk / Reward Ratio", str(plan.get('risk_reward_ratio', 'N/A')))
+            
+        # Row 2: Expected Move Swing Limits
+        l_col1, l_col2, l_col3, l_col4 = st.columns(4)
+        with l_col1:
+            st.metric("Swing Lower Bound (1SD)", f"${low_limit:.2f}" if isinstance(low_limit, (int, float)) else str(low_limit))
+        with l_col2:
+            st.metric("Swing Upper Bound (1SD)", f"${up_limit:.2f}" if isinstance(up_limit, (int, float)) else str(up_limit))
         
         st.markdown("<br>", unsafe_allow_html=True)
         

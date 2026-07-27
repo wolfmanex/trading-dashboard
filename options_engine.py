@@ -1,69 +1,74 @@
 import yfinance as yf
 import pandas as pd
 
-
 def get_options_sentiment(ticker: str) -> dict:
-    """Fetches near-term options chain metrics including Put/Call OI ratio,
-
-    Call Wall, and Put Wall to gauge institutional positioning.
-    """
-    default_data = {
+    """Fetches Options Open Interest, PCR, and Strike Walls.
+       Includes strict data sanitization to prevent 0.0 PCR or phantom strikes."""
+    
+    fallback = {
         "pcr_oi": "N/A",
         "call_wall": "N/A",
         "put_wall": "N/A",
         "expiration": "N/A",
-        "positioning_summary": "No options data available.",
+        "positioning_summary": "Exchange data currently unavailable or corrupted."
     }
-
+    
     try:
         tk = yf.Ticker(ticker)
         expirations = tk.options
-
+        
         if not expirations:
-            return default_data
-
-        # Use the front-month/nearest monthly or weekly expiration
+            return fallback
+            
+        # Target the nearest active expiration date
         target_exp = expirations[0]
-        opt = tk.option_chain(target_exp)
-
-        calls = opt.calls.dropna(subset=["openInterest"])
-        puts = opt.puts.dropna(subset=["openInterest"])
-
+        chain = tk.option_chain(target_exp)
+        
+        # 1. Clean the data: Drop rows where Open Interest is NaN or exactly 0
+        calls = chain.calls.dropna(subset=['openInterest', 'strike'])
+        calls = calls[calls['openInterest'] > 0]
+        
+        puts = chain.puts.dropna(subset=['openInterest', 'strike'])
+        puts = puts[puts['openInterest'] > 0]
+        
         if calls.empty or puts.empty:
-            return default_data
-
-        total_call_oi = calls["openInterest"].sum()
-        total_put_oi = puts["openInterest"].sum()
-
-        pcr_oi = (
-            round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else 0.0
-        )
-
-        # Find strike prices with highest Open Interest
-        call_wall_row = calls.loc[calls["openInterest"].idxmax()]
-        put_wall_row = puts.loc[puts["openInterest"].idxmax()]
-
-        call_wall = float(call_wall_row["strike"])
-        put_wall = float(put_wall_row["strike"])
-
-        # Determine qualitative smart money bias
-        if pcr_oi > 1.2:
-            bias = "Heavy Bearish Hedging / Put-Heavy"
-        elif pcr_oi < 0.65:
-            bias = "Strong Bullish Bias / Call Accumulation"
+            return fallback
+            
+        # 2. Calculate PCR-OI (Put/Call Open Interest Ratio)
+        total_call_oi = calls['openInterest'].sum()
+        total_put_oi = puts['openInterest'].sum()
+        
+        if total_call_oi > 0:
+            pcr_oi = round(total_put_oi / total_call_oi, 2)
         else:
-            bias = "Neutral / Balanced Hedging"
-
+            pcr_oi = "N/A"
+            
+        # 3. Identify Institutional Walls (Strikes with Maximum Open Interest)
+        call_wall_idx = calls['openInterest'].idxmax()
+        put_wall_idx = puts['openInterest'].idxmax()
+        
+        call_wall = float(calls.loc[call_wall_idx]['strike'])
+        put_wall = float(puts.loc[put_wall_idx]['strike'])
+        
+        # 4. Generate AI Positioning Context
+        if isinstance(pcr_oi, float):
+            if pcr_oi > 1.2:
+                summary = "Heavy Put Bias (Institutional Hedging / Bearish)"
+            elif pcr_oi < 0.8:
+                summary = "Heavy Call Bias (Speculative / Bullish)"
+            else:
+                summary = "Neutral / Balanced Positioning"
+        else:
+            summary = "Insufficient OI for sentiment summary."
+            
         return {
-            "expiration": target_exp,
             "pcr_oi": pcr_oi,
             "call_wall": call_wall,
             "put_wall": put_wall,
-            "total_call_oi": int(total_call_oi),
-            "total_put_oi": int(total_put_oi),
-            "positioning_summary": f"PCR-OI at {pcr_oi} ({bias}). Call Wall at USD {call_wall:.2f}, Put Wall at USD {put_wall:.2f} (Exp: {target_exp}).",
+            "expiration": target_exp,
+            "positioning_summary": summary
         }
-
+        
     except Exception as e:
-        print(f"Error fetching options metrics for {ticker}: {e}")
-        return default_data
+        print(f"Options Engine Error for {ticker}: {e}")
+        return fallback

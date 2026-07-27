@@ -7,3 +7,5 @@ nltk
 google-genai
 google-generativeai
 alpaca-py
+twelvedata
+gemini-flash-latest
