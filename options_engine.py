@@ -15,11 +15,21 @@ def get_options_sentiment(ticker: str) -> dict:
     }
     
     try:
-        # 1. Inject a custom User-Agent to prevent yfinance rate-limiting/blocking
+        # 1. Inject a custom User-Agent and extended headers to prevent yfinance rate-limiting/blocking
         session = requests.Session()
         session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
         })
+        
+        # 2. Ping the Yahoo Finance homepage to grab the required session cookies
+        try:
+            session.get("https://finance.yahoo.com", timeout=5)
+        except Exception as e:
+            print(f"Cookie ping failed, continuing anyway: {e}")
         
         tk = yf.Ticker(ticker, session=session)
         expirations = tk.options
@@ -27,7 +37,7 @@ def get_options_sentiment(ticker: str) -> dict:
         if not expirations:
             return fallback
             
-        # 2. Iterate through the first 3 expirations to find valid data
+        # 3. Iterate through the first 3 expirations to find valid data
         for target_exp in expirations[:3]:
             chain = tk.option_chain(target_exp)
             
