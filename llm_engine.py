@@ -55,7 +55,14 @@ def synthesize_signals(
     """Synthesizes technical, macro, options, swing, and intraday metrics into an institutional trade decision."""
     
     if event_data is None:
-        event_data = {"earnings_date": "N/A", "macro_vix": 0.0, "macro_tnx": 0.0, "news_headlines": []}
+        event_data = {
+            "earnings_date": "N/A", 
+            "days_until_earnings": "N/A", 
+            "proximity_flag": "N/A", 
+            "macro_vix": 0.0, 
+            "macro_tnx": 0.0, 
+            "news_headlines": []
+        }
 
     if options_data is None:
         options_data = {"pcr_oi": "N/A", "call_wall": "N/A", "put_wall": "N/A", "positioning_summary": "N/A"}
@@ -103,6 +110,8 @@ Execution Strategy Horizon: **{analysis_mode}**
 - Market Volatility Index (VIX): {event_data.get('macro_vix', 'N/A')}
 - 10-Year Treasury Yield (^TNX): {event_data.get('macro_tnx', 'N/A')}%
 - Upcoming Corporate Earnings Date: {event_data.get('earnings_date', 'N/A')}
+- Days Until Earnings: {event_data.get('days_until_earnings', 'N/A')}
+- Earnings Proximity Flag: {event_data.get('proximity_flag', 'N/A')}
 
 ### 5. SENTIMENT & CATALYST HEADLINES:
 - Overall Sentiment Summary: {sentiment_summary}
@@ -118,6 +127,34 @@ Execution Strategy Horizon: **{analysis_mode}**
 - **MANDATORY INCLUSION**: You MUST explicitly analyze the Put/Call Open Interest Ratio (PCR-OI) and Options Strike Walls inside your `macro_analysis` or `higher_tf_breakdown` text fields. Do not omit this options data.
 - **No Dollar Signs ($)**: NEVER use the '$' symbol in descriptive text explanations or reasoning fields, as it triggers UI rendering bugs. Write prices as numbers or USD.
 - **Bullet Points**: Write all breakdown fields ('higher_tf_breakdown', 'intraday_tf_breakdown', 'macro_analysis', 'news_catalyst_analysis') as clean, bulleted markdown points starting with '- '.
+
+🚨 CRITICAL PROXIMITY RULES (EARNINGS EVENT HORIZON) 🚨
+You must inspect the `days_until_earnings` and `proximity_flag` fields:
+
+1. IF `proximity_flag` == 'IMMEDIATE_BINARY_RISK' (0-2 Days):
+   - RISK LEVEL: Must be set to 'HIGH' or 'EXTREME'.
+   - SWING STRATEGY: Explicitly state that holding shares/naked options into the release is a BINARY GAMBLE. Recommend closing positions before the bell or hedging via options spreads (e.g., defined-risk structures).
+
+2. IF `proximity_flag` == 'SWING_WINDOW_OVERLAP' (3-5 Days):
+   - SWING STRATEGY: You MUST factor earnings into the trade duration. 
+   - Mandatory note: State whether this setup is a "Pre-Earnings Run Up Play" (exiting BEFORE the report) or if the binary risk outweighs the technical setup.
+   - IV CRUSH WARNING: Warn that IV expansion will inflate option premiums and IV crush will destroy post-earnings long options.
+
+3. IF `proximity_flag` == 'OUTSIDE_SWING_WINDOW' (> 5 Days):
+   - Standard technical/swing rules apply.
+
+🚨 CRITICAL RULE: CATALYST COLLISION CHECK 🚨
+Cross-reference the `earnings_date` with macro events and `news_headlines`. 
+If a stock's earnings report or proximity window occurs near or on a major macroeconomic catalyst (e.g., FOMC Rate Decision, Fed decision, CPI release, NFP), you MUST:
+1. Elevate overall risk assessment to HIGH or EXTREME.
+2. Explicitly flag the "Macro/Micro Catalyst Collision" inside your `news_catalyst_analysis` field.
+3. Adjust your execution plan to account for binary, multi-directional volatility (e.g., wider stop losses, defined-risk structures, or exiting before the catalyst).
+
+🚨 CATALYST SCENARIO REASONING 🚨
+If `days_until_earnings` is <= 5, or a major macro event is imminent, you MUST generate predictive scenarios in the `catalyst_scenarios` field:
+1. Bull Case Reaction: What structural levels must break for a sustained rally? (Reference Call Walls and Resistance).
+2. Bear Case Reaction: Where is the ultimate capitulation level if the catalyst fails? (Reference Put Walls and Support).
+3. Tactical Play: Suggest the optimal institutional approach (e.g., "Wait for T+1 post-earnings drift", "Delta-neutral straddle", or "Close 80% of position pre-market").
 
 Synthesize all data and output strictly a SINGLE valid JSON object matching this schema without any outer explanation or extra text:
 
@@ -139,6 +176,7 @@ Synthesize all data and output strictly a SINGLE valid JSON object matching this
   "intraday_tf_breakdown": "- Price cleared PMH and is retesting Session VWAP as support.\n- RVOL at 1.4 confirms strong participation.",
   "macro_analysis": "- Options PCR-OI at 0.58 indicates strong smart money call accumulation.\n- Stock showing Strong Relative Strength vs XLK (+2.4%).",
   "news_catalyst_analysis": "- Upcoming earnings catalyst presents low immediate risk.",
+  "catalyst_scenarios": "- Bull Case: Price gaps above 153.50 Call Wall, triggering a gamma squeeze toward 160.\n- Bear Case: Forward guidance misses, breaking 142 support and dropping to 138 swing limit.\n- Tactical Play: Do not hold directional calls through the bell due to IV Crush. Wait for T+1 morning settlement to trade the post-earnings drift.",
   "detailed_reasoning": "Comprehensive thesis unifying technicals, options OI walls, relative strength, VWAP levels, and expected move guidelines."
 }}
 """
@@ -169,6 +207,7 @@ Synthesize all data and output strictly a SINGLE valid JSON object matching this
             "intraday_tf_breakdown": "- Intraday timeframe synthesis unavailable.",
             "macro_analysis": f"- API Exception: {str(e)}",
             "news_catalyst_analysis": "- N/A",
+            "catalyst_scenarios": "- Scenario modeling unavailable due to API error.",
             "detailed_reasoning": f"An error occurred during AI analysis generation: {str(e)}"
         }
 
