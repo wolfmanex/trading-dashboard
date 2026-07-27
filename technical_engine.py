@@ -83,18 +83,23 @@ def clean_bad_ticks(df: pd.DataFrame, window: int = 14, atr_multiplier: float = 
 def get_technical_data(ticker: str, timeframe: str = "5m") -> pd.DataFrame:
     """Fetches chart data supporting Intraday (5m, 15m, 1h) and Swing/Weekly (1d, 1w) timeframes."""
     
-    # --- 1. PRIMARY ENGINE: YFINANCE ---
+    # --- 1. PRIMARY ENGINE: YFINANCE (With Session Header Protection) ---
     tf_params = {
         "5m": {"period": "7d", "interval": "5m"},
         "15m": {"period": "1mo", "interval": "15m"},
         "1h": {"period": "3mo", "interval": "1h"},
         "1d": {"period": "1y", "interval": "1d"},
-        "1w": {"period": "5y", "interval": "1wk"},  # <--- Added Weekly Support
+        "1w": {"period": "5y", "interval": "1wk"},
     }
     params = tf_params.get(timeframe, {"period": "7d", "interval": "5m"})
 
     try:
-        t = yf.Ticker(ticker)
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+        })
+        
+        t = yf.Ticker(ticker, session=session)
         df = t.history(period=params["period"], interval=params["interval"], prepost=True)
 
         if not df.empty:
@@ -128,7 +133,7 @@ def get_technical_data(ticker: str, timeframe: str = "5m") -> pd.DataFrame:
                 "15m": "15min", 
                 "1h": "1h", 
                 "1d": "1day", 
-                "1w": "1week"  # <--- Added Weekly Support
+                "1w": "1week"
             }
             interval = twelve_tf_map.get(timeframe, "5min")
             
@@ -166,7 +171,7 @@ def get_technical_data(ticker: str, timeframe: str = "5m") -> pd.DataFrame:
                     "15m": (TimeFrame(15, TimeFrameUnit.Minute), 30),
                     "1h": (TimeFrame(1, TimeFrameUnit.Hour), 90),
                     "1d": (TimeFrame(1, TimeFrameUnit.Day), 365),
-                    "1w": (TimeFrame(1, TimeFrameUnit.Week), 730)  # <--- Added Weekly Support
+                    "1w": (TimeFrame(1, TimeFrameUnit.Week), 730)
                 }
                 alpaca_tf, days_back = tf_map.get(timeframe, (TimeFrame(5, TimeFrameUnit.Minute), 7))
                 
@@ -221,7 +226,11 @@ def get_live_price(ticker: str) -> float:
 
     # 1. YFINANCE (Primary)
     try:
-        t = yf.Ticker(ticker)
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+        })
+        t = yf.Ticker(ticker, session=session)
         df_1m = t.history(period="1d", interval="1m", prepost=True)
         if not df_1m.empty:
             last_close = df_1m['Close'].iloc[-1]
