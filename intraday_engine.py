@@ -1,6 +1,35 @@
 import yfinance as yf
 import pandas as pd
 
+
+def calculate_relative_volume(df: pd.DataFrame) -> str:
+    """Compare the latest regular-hours candle with matching prior-day slots."""
+    if df is None or df.empty or "Volume" not in df:
+        return "N/A"
+
+    valid_df = df[df["Volume"] > 0].copy()
+    if valid_df.empty:
+        return "N/A"
+
+    valid_df["session_date"] = valid_df.index.normalize()
+    current_date = valid_df["session_date"].max()
+    current_session = valid_df[valid_df["session_date"] == current_date]
+    prior_sessions = valid_df[valid_df["session_date"] < current_date]
+    if current_session.empty or prior_sessions.empty:
+        return "N/A"
+
+    latest_bar = current_session.iloc[-1]
+    latest_timestamp = current_session.index[-1]
+    latest_slot = latest_timestamp.hour * 60 + latest_timestamp.minute
+
+    prior_slots = prior_sessions.index.hour * 60 + prior_sessions.index.minute
+    matching_volumes = prior_sessions.loc[prior_slots == latest_slot, "Volume"]
+    if matching_volumes.empty or matching_volumes.mean() <= 0:
+        return "N/A"
+
+    return round(float(latest_bar["Volume"] / matching_volumes.mean()), 2)
+
+
 def get_intraday_metrics(ticker: str) -> dict:
     """Calculates Session VWAP, Prior Day Levels, Pre-Market Levels, and RVOL.
        Includes off-hours fallback for weekends and pre-4AM EST dead zones."""
@@ -39,6 +68,11 @@ def get_intraday_metrics(ticker: str) -> dict:
         today_date = unique_days[-1]
         yesterday_date = unique_days[-2]
 
+        regular_hours_df = valid_df[
+            (valid_df.index.time >= pd.to_datetime('09:30').time()) &
+            (valid_df.index.time < pd.to_datetime('16:00').time())
+        ]
+
         # 1. PDH / PDL (Prior Day High / Low during regular hours 09:30 - 16:00)
         yesterday_df = valid_df[(valid_df.index.normalize() == yesterday_date) & 
                                 (valid_df.index.time >= pd.to_datetime('09:30').time()) & 
@@ -59,8 +93,7 @@ def get_intraday_metrics(ticker: str) -> dict:
             metrics['pml'] = "Awaiting Market"
         
         # 3. Session VWAP & RVOL (Today's Regular Hours)
-        today_rh_df = valid_df[(valid_df.index.normalize() == today_date) & 
-                               (valid_df.index.time >= pd.to_datetime('09:30').time())]
+        today_rh_df = regular_hours_df[regular_hours_df.index.normalize() == today_date]
         
         if not today_rh_df.empty:
             typical_price = (today_rh_df['High'] + today_rh_df['Low'] + today_rh_df['Close']) / 3
@@ -70,13 +103,8 @@ def get_intraday_metrics(ticker: str) -> dict:
             vwap = (typical_price * vol).cumsum() / vol.cumsum()
             metrics['vwap'] = round(vwap.iloc[-1], 2)
             
-            # RVOL (Current Volume vs Average Session Volume)
-            current_vol = vol.iloc[-1]
-            avg_vol = vol.mean()
-            if avg_vol > 0:
-                metrics['rvol'] = round(current_vol / avg_vol, 2)
-            else:
-                metrics['rvol'] = 1.0
+            # RVOL compares the latest candle with the same slot on prior days.
+            metrics['rvol'] = calculate_relative_volume(regular_hours_df)
         else:
              metrics['vwap'] = "Market Closed"
              metrics['rvol'] = "Market Closed"

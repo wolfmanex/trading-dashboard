@@ -6,11 +6,13 @@ from plotly.subplots import make_subplots
 from technical_engine import get_technical_data, get_multi_timeframe_data, get_live_price, add_technical_indicators
 from news_engine import get_ticker_news_sentiment
 from index_filter import get_macro_market_trend
-from llm_engine import generate_ai_analysis, synthesize_signals
+from llm_engine import generate_ai_analysis, synthesize_signals, is_ai_configured
 from event_engine import get_upcoming_events
 from options_engine import get_options_sentiment
 from swing_engine import get_swing_metrics
 from intraday_engine import get_intraday_metrics
+from backtest_engine import run_ta_backtest
+from watchlist_engine import get_watchlist_snapshot, normalize_watchlist
 
 
 st.set_page_config(
@@ -124,6 +126,14 @@ if select_mode == "Preset List":
 else:
     selected_ticker = st.sidebar.text_input("Enter Ticker Symbol", "AMD").upper()
 
+watchlist_options = list(dict.fromkeys(preset_tickers + [selected_ticker]))
+watchlist_selection = st.sidebar.multiselect(
+    "Watchlist",
+    watchlist_options,
+    default=[selected_ticker],
+    max_selections=8,
+)
+
 # 3. Chart Timeframe Selection (Automatically defaults based on strategy mode)
 default_tf_index = 0 if "Intra-Day" in analysis_mode else 3
 timeframe = st.sidebar.selectbox(
@@ -131,6 +141,22 @@ timeframe = st.sidebar.selectbox(
     ["5m", "15m", "1h", "1d", "1w"], 
     index=default_tf_index
 )
+
+backtest_holding_period = st.sidebar.number_input(
+    "Backtest Holding Period (bars)", min_value=1, max_value=100, value=5
+)
+backtest_cost_pct = st.sidebar.number_input(
+    "Backtest Cost + Slippage (%)", min_value=0.0, max_value=5.0, value=0.0, step=0.05
+)
+
+if st.sidebar.button("Refresh Market Data", width="stretch"):
+    get_technical_data.clear()
+    get_multi_timeframe_data.clear()
+    get_ticker_news_sentiment.clear()
+    get_macro_market_trend.clear()
+    get_upcoming_events.clear()
+    get_watchlist_snapshot.clear()
+    st.rerun()
 
 # Reset analysis state if user changes the ticker
 if selected_ticker != st.session_state.last_analyzed_ticker:
@@ -147,6 +173,19 @@ with st.spinner(f"Loading market data & events for {selected_ticker}..."):
 if df_chart is None or df_chart.empty:
     st.error(f"No price data available for {selected_ticker} on timeframe {timeframe}. Check ticker or market hours.")
     st.stop()
+
+watchlist = normalize_watchlist(watchlist_selection or [selected_ticker])
+with st.spinner("Loading watchlist snapshot..."):
+    watchlist_df = get_watchlist_snapshot(watchlist, timeframe=timeframe)
+
+st.subheader("📋 Watchlist Overview")
+st.dataframe(watchlist_df, hide_index=True, width="content")
+
+data_source = df_chart.attrs.get("data_source", "Unknown provider")
+latest_candle_timestamp = df_chart.index[-1]
+backtest_data = df_chart.copy(deep=True)
+if hasattr(latest_candle_timestamp, "strftime"):
+    latest_candle_timestamp = latest_candle_timestamp.strftime("%Y-%m-%d %H:%M:%S")
 
 # Helper function to assign badge color classes
 def get_badge_class(text_str: str) -> str:
@@ -176,6 +215,11 @@ else:
     latest_price = float(df_chart['Close'].iloc[-1])
     price_badge_text = f"CLOSED • {selected_ticker}"
     price_badge_class = "badge-neutral"
+
+st.caption(
+    f"Historical feed: {data_source} | Latest candle: {latest_candle_timestamp} "
+    f"| Price status: {price_badge_text}"
+)
 
 rsi_val = df_chart['RSI'].iloc[-1] if 'RSI' in df_chart and not df_chart['RSI'].isna().all() else 0.0
 
@@ -282,7 +326,7 @@ fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#1E2532', row=1, col=1)
 fig.update_xaxes(showgrid=False, row=2, col=1)
 fig.update_yaxes(showgrid=False, row=2, col=1)
 
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 # ==============================================================================
 # UPCOMING EVENTS & MACRO CATALYST SECTION
@@ -304,14 +348,34 @@ if event_data.get("news_headlines"):
             st.write(headline)
 
 st.divider()
+st.subheader("📈 Historical TA Signal Check")
+st.caption(
+    "Fixed-horizon backtest of the deterministic TA score. "
+    f"Holding period: {backtest_holding_period} bars | Estimated costs: {backtest_cost_pct:.2f}% | AI decisions excluded."
+)
+backtest = run_ta_backtest(
+    backtest_data,
+    holding_period=backtest_holding_period,
+    cost_per_trade_pct=backtest_cost_pct,
+)
+if backtest["total_trades"] == 0:
+    st.info("No qualifying historical TA signals were found in the loaded timeframe.")
+else:
+    bt_col1, bt_col2, bt_col3, bt_col4 = st.columns(4)
+    bt_col1.metric("Trades", backtest["total_trades"])
+    bt_col2.metric("Win Rate", f"{backtest['win_rate_pct']}%")
+    bt_col3.metric("Cumulative Return", f"{backtest['cumulative_return_pct']}%")
+    bt_col4.metric("Max Drawdown", f"{backtest['max_drawdown_pct']}%")
+
+st.divider()
 
 # Callback to run multi-timeframe LLM synthesis cleanly with Macro Context
 def run_synthesis_callback():
     with st.spinner("Fetching multi-horizon data, options OI & macro signals..."):
         df_5m, df_4h, df_1d = get_multi_timeframe_data(selected_ticker)
         df_1w = get_technical_data(selected_ticker, timeframe="1w")
-        options_data = get_options_sentiment(selected_ticker)
-        swing_metrics = get_swing_metrics(selected_ticker)
+        options_data = get_options_sentiment(selected_ticker, analysis_mode=analysis_mode)
+        swing_metrics = get_swing_metrics(selected_ticker, analysis_mode=analysis_mode)
         intraday_metrics = get_intraday_metrics(selected_ticker)
 
         st.session_state.llm_analysis = synthesize_signals(
@@ -334,9 +398,12 @@ col_title, col_btn = st.columns([3, 1])
 with col_title:
     st.subheader("🤖 Multi-Timeframe AI Synthesis")
 
+    if not is_ai_configured():
+        st.warning("AI analysis is disabled: configure GEMINI_API_KEY in Streamlit secrets or the environment.")
+
 with col_btn:
     btn_label = "🔄 Regenerate Analysis" if st.session_state.llm_analysis else "🚀 Run AI Analysis"
-    st.button(btn_label, on_click=run_synthesis_callback, use_container_width=True)
+    st.button(btn_label, on_click=run_synthesis_callback, width="stretch")
 
 # Helper to prevent Streamlit from treating dollar signs in AI text as LaTeX
 def sanitize_ai_text(text: str) -> str:

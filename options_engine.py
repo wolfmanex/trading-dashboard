@@ -1,8 +1,48 @@
 import yfinance as yf
 import pandas as pd
 import requests
+from datetime import date, datetime
 
-def get_options_sentiment(ticker: str) -> dict:
+
+def select_expiration_candidates(expirations, analysis_mode: str = "Intra-Day (Scalp/Day Trade)", as_of=None):
+    """Rank future expirations near the requested strategy horizon."""
+    as_of = as_of or date.today()
+    target_days = 7 if "Intra-Day" in analysis_mode else 14
+    candidates = []
+
+    for expiration in expirations:
+        try:
+            expiration_date = datetime.strptime(str(expiration), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        days_out = (expiration_date - as_of).days
+        if days_out >= 0:
+            candidates.append((abs(days_out - target_days), days_out, str(expiration)))
+
+    candidates.sort()
+    return [expiration for _, _, expiration in candidates]
+
+
+def option_midpoint(option) -> float | None:
+    """Return a valid bid/ask midpoint, falling back to last traded price."""
+    bid = option.get("bid")
+    ask = option.get("ask")
+    if has_valid_bid_ask(option):
+        return float((bid + ask) / 2)
+
+    last_price = option.get("lastPrice")
+    if pd.notna(last_price) and last_price > 0:
+        return float(last_price)
+    return None
+
+
+def has_valid_bid_ask(option) -> bool:
+    bid = option.get("bid")
+    ask = option.get("ask")
+    return bool(pd.notna(bid) and pd.notna(ask) and bid >= 0 and ask >= bid and ask > 0)
+
+
+def get_options_sentiment(ticker: str, analysis_mode: str = "Intra-Day (Scalp/Day Trade)") -> dict:
     """Fetches Options Open Interest, PCR, and Strike Walls.
        Iterates through expirations if the nearest one is missing data."""
     
@@ -37,8 +77,9 @@ def get_options_sentiment(ticker: str) -> dict:
         if not expirations:
             return fallback
             
-        # 3. Iterate through the first 3 expirations to find valid data
-        for target_exp in expirations[:3]:
+        # 3. Prefer expirations near the selected strategy horizon.
+        candidate_expirations = select_expiration_candidates(expirations, analysis_mode)[:3]
+        for target_exp in candidate_expirations:
             chain = tk.option_chain(target_exp)
             
             # Clean the data: Drop rows where Open Interest is NaN or exactly 0

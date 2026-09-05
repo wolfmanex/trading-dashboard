@@ -1,6 +1,7 @@
 import os
 import requests
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import streamlit as st
 from datetime import datetime, timedelta
@@ -16,6 +17,37 @@ except ImportError:
     ALPACA_AVAILABLE = False
 
 
+def get_configured_secret(name: str, default: str = "") -> str:
+    try:
+        return st.secrets.get(name) or os.getenv(name, default)
+    except Exception:
+        return os.getenv(name, default)
+
+
+def tag_data_source(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    df.attrs["data_source"] = source
+    return df
+
+
+def validate_ohlcv_data(df: pd.DataFrame) -> bool:
+    required_columns = {"Open", "High", "Low", "Close", "Volume"}
+    if df is None or df.empty or not required_columns.issubset(df.columns):
+        return False
+
+    numeric_data = df[list(required_columns)].apply(pd.to_numeric, errors="coerce")
+    if numeric_data.isna().any().any():
+        return False
+    if (numeric_data[["Open", "High", "Low", "Close"]] <= 0).any().any():
+        return False
+    if (numeric_data["Volume"] < 0).any():
+        return False
+    if (numeric_data["High"] < numeric_data[["Open", "Low", "Close"]].max(axis=1)).any():
+        return False
+    if (numeric_data["Low"] > numeric_data[["Open", "High", "Close"]].min(axis=1)).any():
+        return False
+    return True
+
+
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Applies technical indicators (EMA_9, EMA_21, RSI, MACD, BB) to a price DataFrame."""
     if df.empty or len(df) < 14:
@@ -25,12 +57,18 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
     df['EMA_21'] = df['Close'].ewm(span=21, adjust=False).mean()
 
-    # Relative Strength Index (RSI)
+    # Relative Strength Index (RSI) using Wilder-style smoothing
     delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    average_gain = gain.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    average_loss = loss.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    rs = average_gain / average_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.mask((average_loss == 0) & (average_gain > 0), 100)
+    rsi = rsi.mask((average_gain == 0) & (average_loss > 0), 0)
+    rsi = rsi.mask((average_gain == 0) & (average_loss == 0), 50)
+    df['RSI'] = rsi
 
     # MACD
     exp1 = df['Close'].ewm(span=12, adjust=False).mean()
@@ -115,16 +153,20 @@ def get_technical_data(ticker: str, timeframe: str = "5m") -> pd.DataFrame:
                     df.index = df.index.tz_localize(None)
             else:
                 df.index = pd.to_datetime(df.index)
+
+            df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+            if not validate_ohlcv_data(df):
+                raise ValueError("Yahoo Finance returned invalid OHLCV data")
             
             df = clean_bad_ticks(df)
             df = add_technical_indicators(df)
-            return df
+            return tag_data_source(df, "Yahoo Finance")
             
     except Exception as e:
         print(f"YFinance failed for {ticker} ({timeframe}): {e}. Trying Twelve Data...")
 
     # --- 2. SECONDARY ENGINE: TWELVE DATA ---
-    twelve_key = st.secrets.get("TWELVEDATA_API_KEY") or os.getenv("TWELVEDATA_API_KEY")
+    twelve_key = get_configured_secret("TWELVEDATA_API_KEY")
     if twelve_key:
         try:
             td_ticker = ticker.replace("-", "/") 
@@ -151,17 +193,21 @@ def get_technical_data(ticker: str, timeframe: str = "5m") -> pd.DataFrame:
                     
                     df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
                     df = df.astype(float)
+
+                    df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+                    if not validate_ohlcv_data(df):
+                        raise ValueError("Twelve Data returned invalid OHLCV data")
                     
                     df = clean_bad_ticks(df)
                     df = add_technical_indicators(df)
-                    return df
+                    return tag_data_source(df, "Twelve Data")
         except Exception as e:
             print(f"Twelve Data failed for {ticker}: {e}. Trying Alpaca...")
 
     # --- 3. TERTIARY ENGINE: ALPACA ---
     if ALPACA_AVAILABLE:
-        alpaca_key = st.secrets.get("ALPACA_API_KEY") or os.getenv("ALPACA_API_KEY")
-        alpaca_secret = st.secrets.get("ALPACA_API_SECRET") or os.getenv("ALPACA_API_SECRET")
+        alpaca_key = get_configured_secret("ALPACA_API_KEY")
+        alpaca_secret = get_configured_secret("ALPACA_API_SECRET")
         
         if alpaca_key and alpaca_secret:
             try:
@@ -188,10 +234,14 @@ def get_technical_data(ticker: str, timeframe: str = "5m") -> pd.DataFrame:
                     df = bars.df.loc[ticker].copy()
                     df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
                     df.index = df.index.tz_convert('US/Eastern').tz_localize(None)
+
+                    df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+                    if not validate_ohlcv_data(df):
+                        raise ValueError("Alpaca returned invalid OHLCV data")
                     
                     df = clean_bad_ticks(df)
                     df = add_technical_indicators(df)
-                    return df
+                    return tag_data_source(df, "Alpaca")
             except Exception as e:
                 print(f"Alpaca fallback failed for {ticker}: {e}")
 
@@ -275,7 +325,7 @@ def get_live_price(ticker: str) -> float:
 
     # 3. TWELVE DATA API (Tertiary)
     try:
-        twelve_key = st.secrets.get("TWELVEDATA_API_KEY") or os.getenv("TWELVEDATA_API_KEY")
+        twelve_key = get_configured_secret("TWELVEDATA_API_KEY")
         if twelve_key:
             td_ticker = ticker.replace("-", "/")
             url = f"https://api.twelvedata.com/price?symbol={td_ticker}&apikey={twelve_key}&prepost=true"

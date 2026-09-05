@@ -1,13 +1,26 @@
 import os
 import json
+import math
 import pandas as pd
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+
+
+def get_configured_secret(name: str):
+    """Read a Streamlit secret when available, then fall back to the environment."""
+    try:
+        return st.secrets.get(name) or os.getenv(name)
+    except Exception:
+        return os.getenv(name)
+
 
 # Initialize Google Generative AI Client
-api_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
-if api_key:
-    genai.configure(api_key=api_key)
+api_key = get_configured_secret("GEMINI_API_KEY")
+gemini_client = genai.Client(api_key=api_key) if api_key else None
+
+
+def is_ai_configured() -> bool:
+    return gemini_client is not None
 
 
 def format_dataframe_summary(df: pd.DataFrame, tf_label: str = "5m") -> str:
@@ -37,6 +50,47 @@ def format_dataframe_summary(df: pd.DataFrame, tf_label: str = "5m") -> str:
     - MACD Line: {macd:.3f} | Signal Line: {signal_line:.3f} ({momentum} Momentum)
     - Bollinger Bands: Upper {bb_upper:.2f} USD | Lower {bb_lower:.2f} USD"""
     return summary
+
+
+def validate_synthesis_result(result: dict) -> dict:
+    """Validate and normalize the model response before it reaches the UI."""
+    if not isinstance(result, dict):
+        raise ValueError("AI response must be a JSON object")
+
+    required_fields = {
+        "signal",
+        "confidence",
+        "timeframe_confluence",
+        "execution_plan",
+        "higher_tf_breakdown",
+        "intraday_tf_breakdown",
+        "macro_analysis",
+        "news_catalyst_analysis",
+        "catalyst_scenarios",
+        "detailed_reasoning",
+    }
+    missing_fields = required_fields.difference(result)
+    if missing_fields:
+        raise ValueError(f"AI response missing fields: {sorted(missing_fields)}")
+
+    signal = str(result["signal"]).upper()
+    if signal not in {"BUY", "SELL", "HOLD"}:
+        raise ValueError(f"Unsupported AI signal: {signal}")
+    result["signal"] = signal
+
+    confidence = result["confidence"]
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        raise ValueError("AI confidence must be numeric")
+    if confidence > 1:
+        confidence /= 100
+    if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+        raise ValueError("AI confidence must be between 0 and 1")
+    result["confidence"] = confidence
+
+    if not isinstance(result["execution_plan"], dict):
+        raise ValueError("AI execution_plan must be an object")
+
+    return result
 
 
 def synthesize_signals(
@@ -182,15 +236,18 @@ Synthesize all data and output strictly a SINGLE valid JSON object matching this
 """
 
     try:
-        model = genai.GenerativeModel("gemini-flash-latest")
-        response = model.generate_content(
-            prompt,
-            generation_config={"temperature": 0.2}
+        if gemini_client is None:
+            raise RuntimeError("GEMINI_API_KEY is not configured")
+
+        response = gemini_client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=prompt,
+            config={"temperature": 0.2},
         )
         
         clean_text = response.text.replace("```json", "").replace("```", "").strip()
         result_json = json.loads(clean_text, strict=False)
-        return result_json
+        return validate_synthesis_result(result_json)
 
     except Exception as e:
         print(f"LLM Synthesis Engine Error: {e}")
@@ -217,8 +274,13 @@ def generate_ai_analysis(ticker: str, df: pd.DataFrame) -> str:
     data_summary = format_dataframe_summary(df, "Primary")
     prompt = f"Provide a brief 3-bullet technical breakdown for {ticker} based on:\n{data_summary}"
     try:
-        model = genai.GenerativeModel("gemini-flash-latest")
-        resp = model.generate_content(prompt)
+        if gemini_client is None:
+            raise RuntimeError("GEMINI_API_KEY is not configured")
+
+        resp = gemini_client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=prompt,
+        )
         return resp.text
     except Exception as e:
         return f"Analysis unavailable: {e}"

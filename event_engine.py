@@ -5,8 +5,40 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime, timedelta
 
+
+def get_configured_secret(name: str, default: str = "") -> str:
+    try:
+        return st.secrets.get(name) or os.getenv(name, default)
+    except Exception:
+        return os.getenv(name, default)
+
+
 # Grab Finnhub key from streamlit secrets
-FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY") or os.getenv("FINNHUB_API_KEY", "")
+FINNHUB_API_KEY = get_configured_secret("FINNHUB_API_KEY")
+
+
+def parse_news_headlines(news_items, limit: int = 5) -> list:
+    """Normalize legacy and nested Yahoo Finance news records for the UI."""
+    headlines = []
+    for item in (news_items or [])[:limit]:
+        if not isinstance(item, dict):
+            continue
+
+        content = item.get("content", item)
+        if not isinstance(content, dict):
+            continue
+
+        title = content.get("title", "").strip()
+        if not title:
+            continue
+
+        publisher = content.get("publisher") or content.get("provider") or item.get("publisher") or "News"
+        if isinstance(publisher, dict):
+            publisher = publisher.get("displayName") or publisher.get("name") or "News"
+        headlines.append(f"- {title} ({publisher})")
+
+    return headlines
+
 
 @st.cache_data(ttl=1800)
 def get_upcoming_events(ticker: str) -> dict:
@@ -46,10 +78,7 @@ def get_upcoming_events(ticker: str) -> dict:
             
             # Extract recent news headlines while we have the yfinance object
             if t.news:
-                events["news_headlines"] = [
-                    f"- {item.get('title', '')} ({item.get('publisher', 'News')})" 
-                    for item in t.news[:5]
-                ]
+                events["news_headlines"] = parse_news_headlines(t.news)
     except Exception as e:
         print(f"Error fetching ticker events for {ticker}: {e}")
 

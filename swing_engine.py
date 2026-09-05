@@ -1,5 +1,6 @@
 import yfinance as yf
 import pandas as pd
+from options_engine import has_valid_bid_ask, option_midpoint, select_expiration_candidates
 
 # Standard Institutional Sector Mapping
 SECTOR_MAP = {
@@ -11,7 +12,7 @@ SECTOR_MAP = {
     "GOOGL": "XLC", "META": "XLC"
 }
 
-def get_swing_metrics(ticker: str) -> dict:
+def get_swing_metrics(ticker: str, analysis_mode: str = "Intra-Day (Scalp/Day Trade)") -> dict:
     """Calculates Options Expected Move (ATM Straddle) and Sector Relative Strength."""
     metrics = {
         "expected_move_usd": "N/A",
@@ -21,6 +22,7 @@ def get_swing_metrics(ticker: str) -> dict:
         "sector_etf": "SPY",
         "relative_strength_1w": "N/A",
         "rs_rating": "Neutral / Data Unavailable"
+        ,"expected_move_pricing": "N/A"
     }
     
     try:
@@ -34,7 +36,12 @@ def get_swing_metrics(ticker: str) -> dict:
         # 2. Calculate Weekly Expected Move via ATM Straddle
         expirations = tk.options
         if expirations:
-            target_exp = expirations[0] # Front-week expiration
+            candidate_expirations = select_expiration_candidates(expirations, analysis_mode)
+            if not candidate_expirations:
+                candidate_expirations = []
+            if not candidate_expirations:
+                raise ValueError("No valid future option expirations")
+            target_exp = candidate_expirations[0]
             opt = tk.option_chain(target_exp)
             calls, puts = opt.calls, opt.puts
             
@@ -45,13 +52,26 @@ def get_swing_metrics(ticker: str) -> dict:
             
             if not atm_put.empty:
                 atm_put = atm_put.iloc[0]
-                # The straddle cost (Call + Put) equals the 1 Standard Deviation Expected Move
-                expected_move = float(atm_call['lastPrice'] + atm_put['lastPrice'])
+                call_price = option_midpoint(atm_call)
+                put_price = option_midpoint(atm_put)
+                if call_price is None or put_price is None:
+                    call_price = put_price = None
+                else:
+                    expected_move = call_price + put_price
+
+                if call_price is not None and put_price is not None:
+                    if has_valid_bid_ask(atm_call) and has_valid_bid_ask(atm_put):
+                        metrics["expected_move_pricing"] = "Bid/ask midpoint"
+                    else:
+                        metrics["expected_move_pricing"] = "Last traded price fallback"
+                else:
+                    expected_move = None
                 
-                metrics["expected_move_usd"] = round(expected_move, 2)
-                metrics["expected_move_pct"] = round((expected_move / current_price) * 100, 2)
-                metrics["upper_expected_bound"] = round(current_price + expected_move, 2)
-                metrics["lower_expected_bound"] = round(current_price - expected_move, 2)
+                if expected_move is not None:
+                    metrics["expected_move_usd"] = round(expected_move, 2)
+                    metrics["expected_move_pct"] = round((expected_move / current_price) * 100, 2)
+                    metrics["upper_expected_bound"] = round(current_price + expected_move, 2)
+                    metrics["lower_expected_bound"] = round(current_price - expected_move, 2)
 
         # 3. Calculate Sector Relative Strength (1-Week)
         sector_etf = SECTOR_MAP.get(ticker, "SPY") # Default to S&P 500 if not mapped

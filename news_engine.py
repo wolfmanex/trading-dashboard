@@ -1,5 +1,6 @@
 import yfinance as yf
 import nltk
+import streamlit as st
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # Ensure VADER lexicon is downloaded
@@ -9,6 +10,7 @@ except LookupError:
     nltk.download('vader_lexicon', quiet=True)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def get_ticker_news_sentiment(ticker: str):
     """
     Fetch news for a ticker via yfinance and analyze sentiment with VADER.

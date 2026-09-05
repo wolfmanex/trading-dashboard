@@ -1,7 +1,9 @@
 import pandas as pd
 import yfinance as yf
 import requests
+import streamlit as st
 
+@st.cache_data(ttl=600, show_spinner=False)
 def get_macro_market_trend(index_ticker: str = "^GSPC") -> str:
     """
     Evaluate macro market regime (e.g., S&P 500 ^GSPC) relative to its 200-day SMA.
