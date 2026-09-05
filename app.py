@@ -24,19 +24,49 @@ st.set_page_config(
 # Professional Dashboard Custom Styling (Typography & Glow)
 st.markdown("""
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap');
         
         .stApp { 
-            background-color: #0B0E14; 
-            color: #E2E8F0; 
-            font-family: 'Inter', sans-serif;
+            background:
+                radial-gradient(circle at 85% 0%, rgba(0, 240, 255, 0.08), transparent 34%),
+                linear-gradient(135deg, #090C12 0%, #0B0E14 52%, #0E121B 100%);
+            color: #E2E8F0;
+            font-family: 'Space Grotesk', sans-serif;
+        }
+
+        .block-container {
+            max-width: 1500px;
+            padding-top: 2.25rem;
+            padding-bottom: 3rem;
+        }
+
+        [data-testid="stSidebar"] {
+            background: #0D1119;
+            border-right: 1px solid #202938;
+        }
+
+        [data-testid="stSidebar"] h1,
+        [data-testid="stSidebar"] h2,
+        [data-testid="stSidebar"] h3 {
+            color: #F8FAFC;
+            letter-spacing: -0.02em;
+        }
+
+        h1 {
+            font-weight: 700;
+            letter-spacing: -0.04em;
+            margin-bottom: 0.25rem;
+        }
+
+        h2, h3 {
+            letter-spacing: -0.025em;
         }
         
         .metric-container {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
-            gap: 20px;
-            margin-bottom: 30px;
+            gap: 14px;
+            margin: 1.25rem 0 1.75rem;
         }
         
         @media (max-width: 900px) {
@@ -51,16 +81,16 @@ st.markdown("""
         }
 
         .kpi-card {
-            background: #11151F;
-            border: 1px solid #1E2532;
-            border-radius: 12px;
-            padding: 20px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+            background: rgba(17, 21, 31, 0.88);
+            border: 1px solid #202938;
+            border-radius: 8px;
+            padding: 18px;
+            box-shadow: 0 8px 28px rgba(0, 0, 0, 0.24);
             transition: all 0.3s ease;
         }
         .kpi-card:hover {
             border-color: #00F0FF;
-            transform: translateY(-3px);
+            transform: translateY(-2px);
             box-shadow: 0 8px 24px rgba(0, 240, 255, 0.1);
         }
         .kpi-title {
@@ -72,12 +102,23 @@ st.markdown("""
             font-weight: 600;
         }
         .kpi-value {
-            font-size: 1.8rem;
+            font-size: 1.65rem;
             font-weight: 700;
             color: #FFFFFF;
             display: flex;
             align-items: center;
             justify-content: space-between;
+        }
+
+        [data-testid="stMetric"] {
+            background: rgba(17, 21, 31, 0.72);
+            border: 1px solid #202938;
+            border-radius: 8px;
+            padding: 0.75rem 0.9rem;
+        }
+
+        code, .stCode {
+            font-family: 'IBM Plex Mono', monospace;
         }
         .kpi-badge {
             font-size: 0.75rem;
@@ -179,7 +220,16 @@ with st.spinner("Loading watchlist snapshot..."):
     watchlist_df = get_watchlist_snapshot(watchlist, timeframe=timeframe)
 
 st.subheader("📋 Watchlist Overview")
-st.dataframe(watchlist_df, hide_index=True, width="content")
+st.dataframe(
+    watchlist_df,
+    hide_index=True,
+    width="stretch",
+    column_config={
+        "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+        "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
+        "TA Score": st.column_config.NumberColumn("TA Score", format="%d"),
+    },
+)
 
 data_source = df_chart.attrs.get("data_source", "Unknown provider")
 latest_candle_timestamp = df_chart.index[-1]
