@@ -392,10 +392,12 @@ with col_e2:
 with col_e3:
     st.metric("10Y Treasury Yield (^TNX)", f"{event_data.get('macro_tnx', 0.0)}%")
 
-if event_data.get("news_headlines"):
-    with st.expander("📰 View Recent Catalyst Headlines", expanded=False):
+with st.expander("📰 Recent Catalyst Headlines", expanded=False):
+    if event_data.get("news_headlines"):
         for headline in event_data["news_headlines"]:
-            st.write(headline)
+            st.markdown(headline)
+    else:
+        st.caption("No recent headlines are available for this ticker.")
 
 st.divider()
 st.subheader("📈 Historical TA Signal Check")
