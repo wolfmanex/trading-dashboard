@@ -7,6 +7,7 @@ from bot import calculate_ta_score, get_market_bias, get_news_status, parse_args
 from backtest_engine import run_ta_backtest
 from event_engine import parse_news_headlines
 from watchlist_engine import normalize_watchlist
+from movers_engine import rank_movers
 from intraday_engine import calculate_relative_volume
 from llm_engine import validate_synthesis_result
 from options_engine import has_valid_bid_ask, option_midpoint, select_expiration_candidates
@@ -198,6 +199,24 @@ class MappingTests(unittest.TestCase):
             normalize_watchlist(tickers, max_items=3),
             ["AMD", "NVDA", "QCOM"],
         )
+
+    def test_movers_rank_positive_relative_gains(self):
+        data = pd.DataFrame([
+            {"Ticker": "SLOW", "Price": 100, "Change": 1, "Relative Gain": 0.5, "Day Range": 2, "RVOL": 1},
+            {"Ticker": "FAST", "Price": 100, "Change": 5, "Relative Gain": 4.5, "Day Range": 4, "RVOL": 2},
+            {"Ticker": "WEAK", "Price": 100, "Change": -2, "Relative Gain": -2.5, "Day Range": 8, "RVOL": 3},
+        ])
+
+        result = rank_movers(data, limit=2)
+
+        self.assertEqual(result["Ticker"].tolist(), ["FAST", "SLOW"])
+
+    def test_movers_return_empty_for_no_positive_relative_gains(self):
+        data = pd.DataFrame([
+            {"Ticker": "WEAK", "Price": 100, "Change": -2, "Relative Gain": -2.5, "Day Range": 8, "RVOL": 3},
+        ])
+
+        self.assertTrue(rank_movers(data).empty)
 
 
 class IntradayMetricTests(unittest.TestCase):

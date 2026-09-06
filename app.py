@@ -13,6 +13,8 @@ from swing_engine import get_swing_metrics
 from intraday_engine import get_intraday_metrics
 from backtest_engine import run_ta_backtest
 from watchlist_engine import get_watchlist_snapshot, normalize_watchlist
+from mover_universe import MOVER_UNIVERSE
+from movers_engine import get_market_movers
 
 
 st.set_page_config(
@@ -117,6 +119,158 @@ st.markdown("""
             padding: 0.75rem 0.9rem;
         }
 
+        .status-label {
+            color: #718096;
+            font-size: 0.72rem;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .status-ready { color: #00ff88; }
+        .status-warning { color: #FFD166; }
+        .status-error { color: #ff6b8a; }
+
+        .system-status-bar {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 1rem;
+            background: rgba(17, 21, 31, 0.48);
+            border: 1px solid rgba(32, 41, 56, 0.72);
+            border-radius: 6px;
+            padding: 0.55rem 0.8rem;
+            margin: 0.75rem 0 1.35rem;
+        }
+
+        .system-status-bar .status-label {
+            font-size: 0.62rem;
+            letter-spacing: 0.07em;
+        }
+
+        .system-status-bar .status-value {
+            color: #D8E1EC;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.72rem;
+            white-space: nowrap;
+        }
+
+        @media (max-width: 768px) {
+            .system-status-bar {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 0.75rem;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .system-status-bar {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .section-nav {
+            background: rgba(17, 21, 31, 0.72);
+            border: 1px solid #202938;
+            border-radius: 8px;
+            padding: 0.8rem 1rem;
+            margin: 0.5rem 0 1.5rem;
+        }
+
+        .section-nav a {
+            color: #A9B6C8;
+            margin-right: 1rem;
+            text-decoration: none;
+            font-size: 0.86rem;
+        }
+
+        .section-nav a:hover { color: #00F0FF; }
+
+        .view-button {
+            display: inline-block;
+            width: 100%;
+            box-sizing: border-box;
+            background: #151C28;
+            border: 1px solid #2B394D;
+            border-radius: 6px;
+            color: #D8E1EC !important;
+            padding: 0.55rem 0.7rem;
+            text-align: center;
+            text-decoration: none !important;
+            font-size: 0.78rem;
+            font-weight: 600;
+            transition: border-color 0.2s ease, color 0.2s ease, background 0.2s ease;
+        }
+
+        .view-button:hover {
+            background: #1B2635;
+            border-color: #00F0FF;
+            color: #00F0FF !important;
+        }
+
+        @media (max-width: 768px) {
+            .block-container {
+                padding: 1rem 0.75rem 2rem;
+            }
+
+            h1 { font-size: 1.75rem; }
+            h2 { font-size: 1.35rem; }
+            h3 { font-size: 1.1rem; }
+
+            .metric-container {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 8px;
+                margin: 0.75rem 0 1.25rem;
+            }
+
+            .kpi-card {
+                min-width: 0;
+                padding: 12px;
+            }
+
+            .kpi-value {
+                align-items: flex-start;
+                flex-direction: column;
+                gap: 8px;
+                font-size: 1.25rem;
+            }
+
+            .kpi-badge {
+                max-width: 100%;
+                overflow-wrap: anywhere;
+                white-space: normal;
+            }
+
+            .section-nav a {
+                display: inline-block;
+                margin: 0 0.7rem 0.4rem 0;
+            }
+
+            [data-testid="stMetric"] {
+                min-width: 0;
+                padding: 0.6rem 0.7rem;
+            }
+
+            [data-testid="stMetricLabel"] {
+                overflow-wrap: anywhere;
+            }
+
+            [data-testid="stDataFrame"] {
+                overflow-x: auto;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .metric-container {
+                grid-template-columns: 1fr;
+            }
+
+            .kpi-value {
+                flex-direction: row;
+                align-items: center;
+                justify-content: space-between;
+                font-size: 1.35rem;
+            }
+        }
+
         code, .stCode {
             font-family: 'IBM Plex Mono', monospace;
         }
@@ -152,51 +306,57 @@ st.title("📈 AI Trading Dashboard")
 # ==============================================================================
 st.sidebar.title("Trading Dashboard Controls")
 
-# 1. Strategy Horizon Switcher
-analysis_mode = st.sidebar.radio(
-    "Select Horizon Strategy:",
-    ["Intra-Day (Scalp/Day Trade)", "Weekly (Swing/Position)"]
-)
-
-# 2. Asset Selection (Preset vs Custom Input)
 preset_tickers = ["AMD", "QCOM", "AAPL", "NVDA", "MSFT", "TSLA", "BTC-USD", "EURUSD=X"]
-select_mode = st.sidebar.radio("Ticker Mode", ["Preset List", "Custom Input"])
 
-if select_mode == "Preset List":
-    selected_ticker = st.sidebar.selectbox("Select Asset", preset_tickers)
-else:
-    selected_ticker = st.sidebar.text_input("Enter Ticker Symbol", "AMD").upper()
+with st.sidebar.expander("Asset", expanded=True):
+    select_mode = st.radio("Ticker Mode", ["Preset List", "Custom Input"])
+    if select_mode == "Preset List":
+        selected_ticker = st.selectbox("Select Asset", preset_tickers)
+    else:
+        selected_ticker = st.text_input("Enter Ticker Symbol", "AMD").upper()
 
-watchlist_options = list(dict.fromkeys(preset_tickers + [selected_ticker]))
-watchlist_selection = st.sidebar.multiselect(
-    "Watchlist",
-    watchlist_options,
-    default=[selected_ticker],
-    max_selections=8,
-)
+    watchlist_options = list(dict.fromkeys(preset_tickers + [selected_ticker]))
+    default_watchlist = [selected_ticker] if select_mode == "Custom Input" else preset_tickers[:5]
+    watchlist_selection = st.multiselect(
+        "Watchlist",
+        watchlist_options,
+        default=default_watchlist,
+        max_selections=8,
+    )
 
-# 3. Chart Timeframe Selection (Automatically defaults based on strategy mode)
-default_tf_index = 0 if "Intra-Day" in analysis_mode else 3
-timeframe = st.sidebar.selectbox(
-    "Chart Timeframe", 
-    ["5m", "15m", "1h", "1d", "1w"], 
-    index=default_tf_index
-)
+with st.sidebar.expander("Strategy", expanded=True):
+    analysis_mode = st.radio(
+        "Horizon",
+        ["Weekly (Swing/Position)", "Intra-Day (Scalp/Day Trade)"],
+        index=0,
+    )
+    default_tf_index = 0 if "Intra-Day" in analysis_mode else 3
+    timeframe = st.selectbox(
+        "Chart Timeframe",
+        ["5m", "15m", "1h", "1d", "1w"],
+        index=default_tf_index,
+    )
 
-backtest_holding_period = st.sidebar.number_input(
-    "Backtest Holding Period (bars)", min_value=1, max_value=100, value=5
-)
-backtest_cost_pct = st.sidebar.number_input(
-    "Backtest Cost + Slippage (%)", min_value=0.0, max_value=5.0, value=0.0, step=0.05
-)
+with st.sidebar.expander("Backtest", expanded=False):
+    backtest_holding_period = st.number_input(
+        "Holding Period (bars)", min_value=1, max_value=100, value=5
+    )
+    backtest_cost_pct = st.number_input(
+        "Cost + Slippage (%)", min_value=0.0, max_value=5.0, value=0.0, step=0.05
+    )
 
-if st.sidebar.button("Refresh Market Data", width="stretch"):
+with st.sidebar.expander("Data", expanded=False):
+    st.caption("Cached market data refreshes automatically. Use this control after a provider outage.")
+    refresh_data = st.button("Refresh Market Data", width="stretch")
+
+if refresh_data:
     get_technical_data.clear()
     get_multi_timeframe_data.clear()
     get_ticker_news_sentiment.clear()
     get_macro_market_trend.clear()
     get_upcoming_events.clear()
     get_watchlist_snapshot.clear()
+    get_market_movers.clear()
     st.rerun()
 
 # Reset analysis state if user changes the ticker
@@ -215,27 +375,96 @@ if df_chart is None or df_chart.empty:
     st.error(f"No price data available for {selected_ticker} on timeframe {timeframe}. Check ticker or market hours.")
     st.stop()
 
-watchlist = normalize_watchlist(watchlist_selection or [selected_ticker])
-with st.spinner("Loading watchlist snapshot..."):
-    watchlist_df = get_watchlist_snapshot(watchlist, timeframe=timeframe)
-
-st.subheader("📋 Watchlist Overview")
-st.dataframe(
-    watchlist_df,
-    hide_index=True,
-    width="stretch",
-    column_config={
-        "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
-        "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
-        "TA Score": st.column_config.NumberColumn("TA Score", format="%d"),
-    },
-)
-
 data_source = df_chart.attrs.get("data_source", "Unknown provider")
 latest_candle_timestamp = df_chart.index[-1]
 backtest_data = df_chart.copy(deep=True)
 if hasattr(latest_candle_timestamp, "strftime"):
     latest_candle_timestamp = latest_candle_timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+news_status = "READY" if not news_sentiment.startswith("Neutral (Error") and not news_sentiment.startswith("Neutral (No News") else "NO DATA"
+macro_status = "READY" if not macro_trend.startswith("Neutral (Error") and not macro_trend.startswith("Neutral (Insufficient") else "NO DATA"
+events_status = "READY" if event_data.get("earnings_date") != "N/A" or event_data.get("news_headlines") else "NO DATA"
+ai_status = "READY" if is_ai_configured() else "CONFIGURE KEY"
+
+status_items = [
+    ("Price Feed", data_source, "status-ready"),
+    ("Latest Candle", latest_candle_timestamp, "status-ready"),
+    ("News Feed", news_status, "status-ready" if news_status == "READY" else "status-warning"),
+    ("Macro & Events", "READY" if macro_status == "READY" and events_status == "READY" else "PARTIAL", "status-ready" if macro_status == "READY" and events_status == "READY" else "status-warning"),
+    ("AI Analysis", ai_status, "status-ready" if ai_status == "READY" else "status-warning"),
+]
+status_markup = "".join(
+    f'<div><div class="status-label">{label}</div><strong class="status-value {css_class}">{value}</strong></div>'
+    for label, value, css_class in status_items
+)
+st.markdown(
+    f'<div class="system-status-bar">{status_markup}</div>',
+    unsafe_allow_html=True,
+)
+
+watchlist = normalize_watchlist(watchlist_selection or [selected_ticker])
+with st.spinner("Loading watchlist and market movers..."):
+    watchlist_df = get_watchlist_snapshot(watchlist, timeframe=timeframe)
+    mover_universe = list(dict.fromkeys(MOVER_UNIVERSE + [selected_ticker]))
+    movers_df = get_market_movers(mover_universe)
+
+st.markdown("### Dashboard Views")
+view_columns = st.columns(5, gap="small")
+view_links = [
+    ("Watchlist", "#watchlist-overview"),
+    ("Technicals", "#technical-chart"),
+    ("Catalysts", "#catalysts"),
+    ("Backtest", "#backtest"),
+    ("AI Analysis", "#ai-analysis"),
+]
+for column, (label, anchor) in zip(view_columns, view_links):
+    with column:
+        st.markdown(f'<a class="view-button" href="{anchor}">{label}</a>', unsafe_allow_html=True)
+
+watchlist_col, movers_col = st.columns(2, gap="large")
+with watchlist_col:
+    st.markdown('<div id="watchlist-overview"></div>', unsafe_allow_html=True)
+    st.subheader("📋 Watchlist Overview")
+    st.caption(f"Selected asset: {selected_ticker} | {len(watchlist)} symbols tracked")
+    watchlist_height = max(74, 39 * (len(watchlist_df) + 1))
+    st.dataframe(
+        watchlist_df.drop(columns=["Focus"], errors="ignore"),
+        hide_index=True,
+        height=watchlist_height,
+        width="stretch",
+        column_config={
+            "Focus": st.column_config.TextColumn("", width="small"),
+            "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+            "Change": st.column_config.NumberColumn("Today", format="%.2f%%"),
+            "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
+            "TA Score": st.column_config.NumberColumn("TA Score", format="%d"),
+        },
+    )
+
+with movers_col:
+    st.markdown('<div id="market-movers"></div>', unsafe_allow_html=True)
+    st.subheader("⚡ Top Market Movers")
+    scan_timestamp = movers_df.attrs.get("scan_timestamp", "Unavailable")
+    universe_size = movers_df.attrs.get("universe_size", len(mover_universe))
+    st.caption(f"Positive relative movers | {universe_size} stocks scanned | {scan_timestamp}")
+    if movers_df.empty:
+        st.info("No positive relative movers are available for the current market session.")
+    else:
+        movers_height = max(74, 39 * (len(movers_df) + 1))
+        st.dataframe(
+            movers_df,
+            hide_index=True,
+            height=movers_height,
+            width="stretch",
+            column_config={
+                "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                "Change": st.column_config.NumberColumn("Change", format="%.2f%%"),
+                "Relative Gain": st.column_config.NumberColumn("Vs SPY", format="%.2f%%"),
+                "Day Range": st.column_config.NumberColumn("Day Range", format="%.2f%%"),
+                "RVOL": st.column_config.NumberColumn("RVOL", format="%.2fx"),
+                "Mover Score": st.column_config.NumberColumn("Score", format="%.1f"),
+            },
+        )
 
 # Helper function to assign badge color classes
 def get_badge_class(text_str: str) -> str:
@@ -318,6 +547,7 @@ st.markdown(f"""
 
 st.divider()
 
+st.markdown('<div id="technical-chart"></div>', unsafe_allow_html=True)
 # Interactive Candlestick Chart with Volume
 st.subheader(f"📊 Technical Chart ({timeframe}) — {selected_ticker} [{analysis_mode}]")
 
@@ -381,6 +611,7 @@ st.plotly_chart(fig, width="stretch")
 # ==============================================================================
 # UPCOMING EVENTS & MACRO CATALYST SECTION
 # ==============================================================================
+st.markdown('<div id="catalysts"></div>', unsafe_allow_html=True)
 st.divider()
 st.subheader("🌐 Catalysts & Macro Economic Environment")
 
@@ -400,6 +631,7 @@ with st.expander("📰 Recent Catalyst Headlines", expanded=False):
         st.caption("No recent headlines are available for this ticker.")
 
 st.divider()
+st.markdown('<div id="backtest"></div>', unsafe_allow_html=True)
 st.subheader("📈 Historical TA Signal Check")
 st.caption(
     "Fixed-horizon backtest of the deterministic TA score. "
@@ -445,6 +677,7 @@ def run_synthesis_callback():
         )
 
 # Section: AI Synthesis Control
+st.markdown('<div id="ai-analysis"></div>', unsafe_allow_html=True)
 col_title, col_btn = st.columns([3, 1])
 
 with col_title:

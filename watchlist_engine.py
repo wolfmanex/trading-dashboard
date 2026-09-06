@@ -23,25 +23,40 @@ def get_watchlist_snapshot(tickers, timeframe: str = "5m") -> pd.DataFrame:
         if prices is None or prices.empty:
             rows.append({
                 "Ticker": ticker,
+                "Focus": "",
                 "Price": None,
+                "Change": None,
                 "RSI": None,
                 "TA Score": None,
-                "News": "Unavailable",
+                "News": "N/A",
             })
             continue
 
         sentiment, _ = get_ticker_news_sentiment(ticker)
         latest = prices.iloc[-1]
         rsi = latest.get("RSI")
+        daily_prices = get_technical_data(ticker, timeframe="1d")
+        if daily_prices is not None and len(daily_prices) >= 2:
+            daily_change = (daily_prices["Close"].iloc[-1] / daily_prices["Close"].iloc[-2] - 1) * 100
+        else:
+            daily_change = None
+        if sentiment.startswith("Bullish"):
+            news_label = "Bullish"
+        elif sentiment.startswith("Bearish"):
+            news_label = "Bearish"
+        else:
+            news_label = "Neutral"
         rows.append({
             "Ticker": ticker,
+            "Focus": "",
             "Price": round(float(latest["Close"]), 2),
+            "Change": round(float(daily_change), 2) if daily_change is not None else None,
             "RSI": round(float(rsi), 1) if pd.notna(rsi) else "N/A",
             "TA Score": calculate_ta_score(prices),
-            "News": sentiment,
+            "News": news_label,
         })
 
     snapshot = pd.DataFrame(rows)
-    for column in ("Price", "RSI", "TA Score"):
+    for column in ("Price", "Change", "RSI", "TA Score"):
         snapshot[column] = pd.to_numeric(snapshot[column], errors="coerce")
     return snapshot
