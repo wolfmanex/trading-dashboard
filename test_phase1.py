@@ -8,6 +8,7 @@ from backtest_engine import run_ta_backtest
 from event_engine import parse_news_headlines
 from watchlist_engine import normalize_watchlist
 from movers_engine import rank_movers
+from stock_info import format_profile_summary
 from intraday_engine import calculate_relative_volume
 from llm_engine import validate_synthesis_result
 from options_engine import has_valid_bid_ask, option_midpoint, select_expiration_candidates
@@ -217,6 +218,17 @@ class MappingTests(unittest.TestCase):
         ])
 
         self.assertTrue(rank_movers(data).empty)
+
+    def test_profile_summary_handles_missing_business_description(self):
+        self.assertEqual(
+            format_profile_summary({"summary": ""}),
+            "Business description unavailable.",
+        )
+
+    def test_profile_summary_is_not_truncated(self):
+        summary = format_profile_summary({"summary": "x" * 300})
+
+        self.assertEqual(len(summary), 300)
 
 
 class IntradayMetricTests(unittest.TestCase):

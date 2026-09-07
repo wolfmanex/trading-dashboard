@@ -1,5 +1,6 @@
 import pandas as pd
 import streamlit as st
+from html import escape
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -15,6 +16,7 @@ from backtest_engine import run_ta_backtest
 from watchlist_engine import get_watchlist_snapshot, normalize_watchlist
 from mover_universe import MOVER_UNIVERSE
 from movers_engine import get_market_movers
+from stock_info import get_stock_profile, format_profile_summary
 
 
 st.set_page_config(
@@ -130,6 +132,27 @@ st.markdown("""
         .status-ready { color: #00ff88; }
         .status-warning { color: #FFD166; }
         .status-error { color: #ff6b8a; }
+
+        .profile-label {
+            color: #8FA1B5;
+            font-size: 0.75rem;
+            font-weight: 600;
+            letter-spacing: 0.07em;
+            text-transform: uppercase;
+        }
+
+        .profile-value {
+            color: #F3F7FC;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 1rem;
+            font-weight: 500;
+            line-height: 1.35;
+            margin-top: 0.25rem;
+        }
+
+        .profile-description-spacer {
+            height: 1rem;
+        }
 
         .system-status-bar {
             display: grid;
@@ -357,6 +380,7 @@ if refresh_data:
     get_upcoming_events.clear()
     get_watchlist_snapshot.clear()
     get_market_movers.clear()
+    get_stock_profile.clear()
     st.rerun()
 
 # Reset analysis state if user changes the ticker
@@ -465,6 +489,29 @@ with movers_col:
                 "Mover Score": st.column_config.NumberColumn("Score", format="%.1f"),
             },
         )
+
+st.divider()
+st.markdown('<div id="selected-asset"></div>', unsafe_allow_html=True)
+st.subheader("Selected Asset")
+stock_profile = get_stock_profile(selected_ticker)
+profile_columns = st.columns([1.2, 2.0, 1.3, 1.5, 1.2])
+profile_items = [
+    ("Ticker", stock_profile["ticker"]),
+    ("Company", stock_profile["name"]),
+    ("Sector", stock_profile["sector"]),
+    ("Industry", stock_profile["industry"]),
+    ("Exchange", stock_profile["exchange"]),
+]
+for column, (label, value) in zip(profile_columns, profile_items):
+    with column:
+        st.markdown(
+            f'<div class="profile-label">{escape(label)}</div>'
+            f'<div class="profile-value">{escape(str(value))}</div>',
+            unsafe_allow_html=True,
+        )
+st.markdown('<div class="profile-description-spacer"></div>', unsafe_allow_html=True)
+with st.expander("Business description", expanded=False):
+    st.write(format_profile_summary(stock_profile))
 
 # Helper function to assign badge color classes
 def get_badge_class(text_str: str) -> str:
