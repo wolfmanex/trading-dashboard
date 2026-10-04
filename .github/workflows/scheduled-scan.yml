@@ -6,6 +6,12 @@ on:
     - cron: "0 13 * * 1-5"
   workflow_dispatch:
 
+# The scan commits the signal log, so two runs must not race each other's push.
+concurrency: scheduled-scan
+
+permissions:
+  contents: write
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -17,9 +23,28 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Check out the signal log branch
+        # The log lives on its own branch so the daily commit doesn't touch main or redeploy the app.
+        run: |
+          if git ls-remote --exit-code --heads origin signal-log; then
+            git fetch --depth=1 origin signal-log:refs/remotes/origin/signal-log
+            git worktree add -B signal-log signal-log-data origin/signal-log
+          else
+            git worktree add --orphan -b signal-log signal-log-data
+          fi
       - name: Run scan
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scheduled_scan.py
+        run: python scheduled_scan.py --log signal-log-data/signal_log.csv
+      - name: Save the signal log
+        if: always()
+        working-directory: signal-log-data
+        run: |
+          [ -f signal_log.csv ] || exit 0
+          git add signal_log.csv
+          git diff --cached --quiet && exit 0
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "Signal log $(TZ=America/New_York date +%F)"
+          git push origin signal-log

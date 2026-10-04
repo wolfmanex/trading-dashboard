@@ -28,6 +28,9 @@ from movers_engine import get_market_movers
 from stock_info import get_stock_profile, format_profile_summary
 from risk_engine import position_size
 from earnings_engine import EARNINGS_WINDOW_DAYS, add_earnings_columns, get_upcoming_earnings
+from secrets_config import get_configured_secret
+from signal_log import LOG_URL, OPEN, WAITING, fetch_published_log, summarize_log
+from scheduled_scan import TOP_N as ALERTED_TOP_N
 from smallcap_screener import (
     get_candidate_context, get_smallcap_universe, scan_smallcap_breakouts,
     get_smallcap_regime, backtest_smallcap_breakouts,
@@ -84,6 +87,13 @@ CHART_AMBER = "#F59E0B"
 
 DASHBOARD_TAB = "Dashboard"
 SCANNER_TAB = "Breakout Scanner"
+TRACK_RECORD_TAB = "Track Record"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_signal_log():
+    """The forward signal log the scheduled scan publishes on the signal-log branch."""
+    return fetch_published_log(get_configured_secret("SIGNAL_LOG_URL") or LOG_URL)
 
 
 def load_scanner_ticker():
@@ -226,8 +236,8 @@ st.markdown(
 )
 
 
-dashboard_tab, scanner_tab = st.tabs(
-    [DASHBOARD_TAB, SCANNER_TAB], key="main_view", on_change="rerun"
+dashboard_tab, scanner_tab, track_tab = st.tabs(
+    [DASHBOARD_TAB, SCANNER_TAB, TRACK_RECORD_TAB], key="main_view", on_change="rerun"
 )
 
 # Only the open tab runs, so working in the scanner doesn't reload the dashboard's data (and vice versa)
@@ -948,3 +958,74 @@ with dashboard_tab:
                 st.markdown(sanitize_ai_text(str(res)))
         else:
             st.info("Click 'Run AI Analysis' above to generate a multi-timeframe unified trade decision.")
+
+with track_tab:
+    if track_tab.open:
+        st.subheader("Scanner Track Record")
+        st.caption(
+            "Every setup the weekday scheduled scan finds (after the earnings filter) is logged before the open and "
+            "followed forward with the backtest's rules: buy-stop at the pivot within 10 trading days, then exit at "
+            "the stop, the target, or after 40 days. Unlike the backtest, nothing here is replayed after the fact. "
+            "Results are in R (multiples of the initial risk)."
+        )
+        try:
+            signal_log = load_signal_log()
+        except Exception as error:
+            signal_log = None
+            st.error(f"Signal log unavailable: {error}")
+
+        if signal_log is not None and signal_log.empty:
+            st.info("No signals logged yet. The first ones appear after the next scheduled scan (weekdays, before the US open).")
+        elif signal_log is not None:
+            scope = st.radio(
+                "Signals", [f"Top {ALERTED_TOP_N} (sent as alerts)", "All logged setups"],
+                horizontal=True, key="track_record_scope",
+            )
+            summary = summarize_log(signal_log, max_rank=ALERTED_TOP_N if scope.startswith("Top") else None)
+
+            tr1, tr2, tr3, tr4, tr5 = st.columns(5)
+            tr1.metric("Signals", summary["signals"])
+            tr2.metric("Closed Trades", summary["trades"])
+            tr3.metric("Win Rate", f"{summary['win_rate_pct']}%" if summary["trades"] else "N/A")
+            tr4.metric("Average R", f"{summary['average_r']:+.2f}R" if summary["trades"] else "N/A")
+            tr5.metric("Total R", f"{summary['total_r']:+.1f}R" if summary["trades"] else "N/A")
+
+            details = [
+                f"Logged since {summary['first_scan']} (last scan {summary['last_scan']})",
+                f"{summary['waiting']} waiting to trigger",
+                f"{summary['still_open']} open",
+                f"{summary['not_triggered']} never triggered",
+            ]
+            if summary["average_return_pct"] is not None and summary["average_iwm_pct"] is not None:
+                details.append(
+                    f"closed trades averaged {summary['average_return_pct']:+.2f}% vs IWM "
+                    f"{summary['average_iwm_pct']:+.2f}% over the same days"
+                )
+            st.caption(" | ".join(details))
+            if summary["trades"] < 30:
+                st.caption("Fewer than 30 closed trades so far, so these numbers are still mostly noise.")
+
+            table = signal_log.copy()
+            if scope.startswith("Top"):
+                table = table[pd.to_numeric(table["Rank"], errors="coerce") <= ALERTED_TOP_N]
+            table = table.sort_values(["Scan Date", "Rank"], ascending=[False, True])
+            st.dataframe(
+                table.drop(columns=["Universe", "Updated"]), hide_index=True, width="stretch",
+                column_config={
+                    "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                    "Pivot": st.column_config.NumberColumn("Pivot", format="$%.2f"),
+                    "Stop": st.column_config.NumberColumn("Stop", format="$%.2f"),
+                    "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
+                    "Reward/Risk": st.column_config.NumberColumn("R:R", format="%.1f"),
+                    "Breakout Score": st.column_config.NumberColumn("Score", format="%.0f"),
+                    "Entry": st.column_config.NumberColumn("Entry", format="$%.2f"),
+                    "Exit": st.column_config.NumberColumn("Exit", format="$%.2f"),
+                    "R": st.column_config.NumberColumn("R", format="%+.2f"),
+                    "Return %": st.column_config.NumberColumn("Return", format="%+.2f%%"),
+                    "IWM %": st.column_config.NumberColumn("IWM", format="%+.2f%%"),
+                },
+            )
+            st.caption(
+                f"{OPEN} trades show their mark at the latest close; {WAITING} signals haven't traded through the pivot yet. "
+                "Screening output is informational, not investment advice."
+            )
