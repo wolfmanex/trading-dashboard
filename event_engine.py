@@ -1,16 +1,10 @@
-import os
 import requests
 import yfinance as yf
 import pandas as pd
 import streamlit as st
 from datetime import datetime, timedelta
 
-
-def get_configured_secret(name: str, default: str = "") -> str:
-    try:
-        return st.secrets.get(name) or os.getenv(name, default)
-    except Exception:
-        return os.getenv(name, default)
+from secrets_config import get_configured_secret
 
 
 # Grab Finnhub key from streamlit secrets

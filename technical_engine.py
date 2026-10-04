@@ -1,4 +1,3 @@
-import os
 import requests
 import pandas as pd
 import numpy as np
@@ -6,6 +5,8 @@ import yfinance as yf
 import streamlit as st
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
+
+from secrets_config import get_configured_secret
 
 # Safely import Alpaca if installed
 try:
@@ -16,13 +17,6 @@ try:
     ALPACA_AVAILABLE = True
 except ImportError:
     ALPACA_AVAILABLE = False
-
-
-def get_configured_secret(name: str, default: str = "") -> str:
-    try:
-        return st.secrets.get(name) or os.getenv(name, default)
-    except Exception:
-        return os.getenv(name, default)
 
 
 def tag_data_source(df: pd.DataFrame, source: str) -> pd.DataFrame:
