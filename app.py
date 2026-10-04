@@ -7,7 +7,7 @@ from plotly.subplots import make_subplots
 from technical_engine import get_technical_data, get_multi_timeframe_data, get_live_price, add_technical_indicators
 from news_engine import get_ticker_news_sentiment
 from index_filter import get_macro_market_trend
-from llm_engine import generate_ai_analysis, synthesize_signals, is_ai_configured
+from llm_engine import generate_ai_analysis, synthesize_signals, is_ai_configured, review_breakout_candidates
 from event_engine import get_upcoming_events
 from options_engine import get_options_sentiment
 from swing_engine import get_swing_metrics
@@ -17,6 +17,10 @@ from watchlist_engine import get_watchlist_snapshot, normalize_watchlist
 from mover_universe import MOVER_UNIVERSE
 from movers_engine import get_market_movers
 from stock_info import get_stock_profile, format_profile_summary
+from smallcap_screener import (
+    get_candidate_context, get_smallcap_universe, scan_smallcap_breakouts,
+    MIN_MARKET_CAP, MAX_MARKET_CAP, MIN_REWARD_RISK, MIN_DOLLAR_VOLUME,
+)
 
 
 st.set_page_config(
@@ -320,6 +324,34 @@ if "llm_analysis" not in st.session_state:
     st.session_state.llm_analysis = None
 if "last_analyzed_ticker" not in st.session_state:
     st.session_state.last_analyzed_ticker = None
+if "ticker_mode" not in st.session_state:
+    st.session_state.ticker_mode = "Preset List"
+if "custom_ticker" not in st.session_state:
+    st.session_state.custom_ticker = "AMD"
+if "scanner_results" not in st.session_state:
+    st.session_state.scanner_results = None
+if "scanner_reviews" not in st.session_state:
+    st.session_state.scanner_reviews = {}
+if "scanner_review_error" not in st.session_state:
+    st.session_state.scanner_review_error = None
+
+
+# Helper to prevent Streamlit from treating dollar signs in AI text as LaTeX
+def sanitize_ai_text(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    # Escapes unescaped $ signs so Streamlit won't parse them as LaTeX math formulas
+    return text.replace("$", r"\$")
+
+
+def load_scanner_ticker():
+    """Switch the dashboard to the breakout candidate clicked in the scanner table."""
+    selection = st.session_state.get("breakout_table")
+    rows = selection.selection.rows if selection else []
+    tickers = st.session_state.get("scanner_display_tickers", [])
+    if rows and rows[0] < len(tickers):
+        st.session_state.ticker_mode = "Custom Input"
+        st.session_state.custom_ticker = tickers[rows[0]]
 
 
 st.title("📈 AI Trading Dashboard")
@@ -332,11 +364,11 @@ st.sidebar.title("Trading Dashboard Controls")
 preset_tickers = ["AMD", "QCOM", "AAPL", "NVDA", "MSFT", "TSLA", "BTC-USD", "EURUSD=X"]
 
 with st.sidebar.expander("Asset", expanded=True):
-    select_mode = st.radio("Ticker Mode", ["Preset List", "Custom Input"])
+    select_mode = st.radio("Ticker Mode", ["Preset List", "Custom Input"], key="ticker_mode")
     if select_mode == "Preset List":
         selected_ticker = st.selectbox("Select Asset", preset_tickers)
     else:
-        selected_ticker = st.text_input("Enter Ticker Symbol", "AMD").upper()
+        selected_ticker = st.text_input("Enter Ticker Symbol", key="custom_ticker").strip().upper()
 
     watchlist_options = list(dict.fromkeys(preset_tickers + [selected_ticker]))
     default_watchlist = [selected_ticker] if select_mode == "Custom Input" else preset_tickers[:5]
@@ -381,6 +413,9 @@ if refresh_data:
     get_watchlist_snapshot.clear()
     get_market_movers.clear()
     get_stock_profile.clear()
+    get_smallcap_universe.clear()
+    scan_smallcap_breakouts.clear()
+    get_candidate_context.clear()
     st.rerun()
 
 # Reset analysis state if user changes the ticker
@@ -433,9 +468,10 @@ with st.spinner("Loading watchlist and market movers..."):
     movers_df = get_market_movers(mover_universe)
 
 st.markdown("### Dashboard Views")
-view_columns = st.columns(5, gap="small")
+view_columns = st.columns(6, gap="small")
 view_links = [
     ("Watchlist", "#watchlist-overview"),
+    ("Breakouts", "#breakout-scanner"),
     ("Technicals", "#technical-chart"),
     ("Catalysts", "#catalysts"),
     ("Backtest", "#backtest"),
@@ -489,6 +525,104 @@ with movers_col:
                 "Mover Score": st.column_config.NumberColumn("Score", format="%.1f"),
             },
         )
+
+
+st.divider()
+st.markdown('<div id="breakout-scanner"></div>', unsafe_allow_html=True)
+scan_title_col, scan_btn_col = st.columns([3, 1])
+with scan_title_col:
+    st.subheader("🚀 Small-Cap Breakout Scanner")
+    st.caption(
+        f"US stocks with a {MIN_MARKET_CAP / 1e6:,.0f}M-{MAX_MARKET_CAP / 1e9:,.0f}B USD market cap and at least "
+        f"{MIN_DOLLAR_VOLUME / 1e6:,.0f}M USD average daily dollar volume, in a 3-8 week base within 8% of the pivot, "
+        f"above the 50-day average, with a measured-move reward/risk of {MIN_REWARD_RISK:.0f}:1 or better."
+    )
+with scan_btn_col:
+    if st.button("🔎 Run Breakout Scan", width="stretch"):
+        with st.spinner("Screening small caps and measuring bases (this can take up to a minute)..."):
+            st.session_state.scanner_results = scan_smallcap_breakouts()
+        st.session_state.scanner_reviews = {}
+        st.session_state.scanner_review_error = None
+
+scan_results = st.session_state.scanner_results
+if scan_results is None:
+    st.info("Run the scan to find small caps setting up for a breakout. Results are cached for 15 minutes.")
+elif scan_results.empty:
+    st.warning(scan_results.attrs.get("error") or "No small caps currently meet the breakout and reward/risk criteria.")
+else:
+    st.caption(
+        f"{len(scan_results)} setups | {scan_results.attrs.get('analyzed', 'N/A')} of "
+        f"{scan_results.attrs.get('universe_size', 'N/A')} stocks analyzed | "
+        f"{scan_results.attrs.get('scan_timestamp', '')} | Click a row to load it into the dashboard."
+    )
+    reviews = st.session_state.scanner_reviews
+    display_df = scan_results.copy()
+    display_df.insert(1, "AI Grade", [reviews.get(t, {}).get("grade", "") for t in display_df["Ticker"]])
+    display_df.insert(2, "AI Risk", [reviews.get(t, {}).get("risk_level", "") for t in display_df["Ticker"]])
+    display_df["Market Cap"] = display_df["Market Cap"].apply(
+        lambda value: value / 1e6 if isinstance(value, (int, float)) else None
+    )
+    st.session_state.scanner_display_tickers = list(display_df["Ticker"])
+    st.dataframe(
+        display_df,
+        key="breakout_table",
+        on_select=load_scanner_ticker,
+        selection_mode="single-row",
+        hide_index=True,
+        width="stretch",
+        height=min(39 * (len(display_df) + 1), 460),
+        column_config={
+            "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+            "Market Cap": st.column_config.NumberColumn("Mkt Cap", format="$%.0fM"),
+            "Pivot": st.column_config.NumberColumn("Pivot", format="$%.2f"),
+            "To Pivot": st.column_config.NumberColumn("To Pivot", format="%.2f%%"),
+            "Stop": st.column_config.NumberColumn("Stop", format="$%.2f"),
+            "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
+            "Reward/Risk": st.column_config.NumberColumn("R:R", format="%.1f"),
+            "Base Depth": st.column_config.NumberColumn("Base Depth", format="%.1f%%"),
+            "RVOL": st.column_config.NumberColumn("RVOL", format="%.2fx"),
+            "RS vs IWM": st.column_config.NumberColumn("RS vs IWM (3M)", format="%.1f%%"),
+            "Breakout Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
+        },
+    )
+
+    review_count = min(8, len(scan_results))
+    review_col, review_note_col = st.columns([1, 3])
+    with review_col:
+        run_review = st.button(
+            f"🤖 AI Review Top {review_count}",
+            width="stretch",
+            disabled=not is_ai_configured(),
+        )
+    with review_note_col:
+        st.caption(
+            "Grades the top setups for catalysts and small-cap red flags (dilution, reverse splits, "
+            "earnings inside the breakout window) in a single Gemini request."
+            if is_ai_configured() else "AI review needs GEMINI_API_KEY in Streamlit secrets or the environment."
+        )
+    if run_review:
+        candidates = scan_results.head(review_count).to_dict("records")
+        with st.spinner("Collecting float, short interest and headlines for the top candidates..."):
+            contexts = {c["Ticker"]: get_candidate_context(c["Ticker"]) for c in candidates}
+        with st.spinner("Running AI review..."):
+            review_result = review_breakout_candidates(candidates, contexts)
+        st.session_state.scanner_reviews = review_result["reviews"]
+        st.session_state.scanner_review_error = review_result["error"]
+        st.rerun()
+
+    if st.session_state.scanner_review_error:
+        st.error(f"AI review failed: {st.session_state.scanner_review_error}")
+    for ticker in scan_results["Ticker"]:
+        review = reviews.get(ticker)
+        if not review:
+            continue
+        with st.expander(f"{ticker} | Grade {review['grade']} | Risk {review['risk_level']} | {review['catalyst']}"):
+            st.markdown(sanitize_ai_text(review["thesis"]) or "No thesis provided.")
+            if review["red_flags"]:
+                st.markdown("**Red flags:**\n" + "\n".join(f"- {sanitize_ai_text(flag)}" for flag in review["red_flags"]))
+            else:
+                st.caption("No red flags identified from the available data.")
+    st.caption("Screening output is informational, not investment advice. Small-cap breakouts fail often; size positions from the stop.")
 
 st.divider()
 st.markdown('<div id="selected-asset"></div>', unsafe_allow_html=True)
@@ -653,6 +787,20 @@ fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#1E2532', row=1, col=1)
 fig.update_xaxes(showgrid=False, row=2, col=1)
 fig.update_yaxes(showgrid=False, row=2, col=1)
 
+# Overlay breakout levels when the selected asset came from the scanner
+if scan_results is not None and not scan_results.empty and selected_ticker in set(scan_results["Ticker"]):
+    breakout_row = scan_results.loc[scan_results["Ticker"] == selected_ticker].iloc[0]
+    for level, label, color in (
+        ("Pivot", "Pivot", "#00F0FF"),
+        ("Stop", "Stop", "#ff0055"),
+        ("Target", "Target", "#00ff88"),
+    ):
+        fig.add_hline(
+            y=breakout_row[level], line_dash="dash", line_color=color, line_width=1,
+            annotation_text=f"{label} {breakout_row[level]:.2f}", annotation_font_color=color,
+            row=1, col=1,
+        )
+
 st.plotly_chart(fig, width="stretch")
 
 # ==============================================================================
@@ -749,13 +897,6 @@ with col_title:
 with col_btn:
     btn_label = "🔄 Regenerate Analysis" if st.session_state.llm_analysis else "🚀 Run AI Analysis"
     st.button(btn_label, on_click=run_synthesis_callback, width="stretch")
-
-# Helper to prevent Streamlit from treating dollar signs in AI text as LaTeX
-def sanitize_ai_text(text: str) -> str:
-    if not isinstance(text, str):
-        return text
-    # Escapes unescaped $ signs so Streamlit won't parse them as LaTeX math formulas
-    return text.replace("$", r"\$")
 
 # Render Multi-Factor Deep AI Results
 if st.session_state.llm_analysis:
