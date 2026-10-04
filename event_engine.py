@@ -61,26 +61,36 @@ def get_upcoming_events(ticker: str) -> dict:
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
-                if "earningsCalendar" in data and len(data["earningsCalendar"]) > 0:
-                    events["earnings_date"] = data["earningsCalendar"][0].get("date", "N/A")
+                upcoming_dates = sorted(
+                    entry["date"] for entry in data.get("earningsCalendar", []) if entry.get("date")
+                )
+                if upcoming_dates:
+                    events["earnings_date"] = upcoming_dates[0]
+    except Exception as e:
+        print(f"Finnhub earnings lookup failed for {ticker}: {e}")
 
-        # Fallback to yfinance if Finnhub fails or key is missing
-        if events["earnings_date"] == "N/A":
-            t = yf.Ticker(ticker)
+    t = yf.Ticker(ticker)
+
+    # Fallback to yfinance if Finnhub fails or key is missing
+    if events["earnings_date"] == "N/A":
+        try:
             today_utc = pd.Timestamp(datetime.today()).tz_localize('UTC')
-            
+
             if hasattr(t, 'earnings_dates') and t.earnings_dates is not None:
                 df = t.earnings_dates
                 if not df.empty:
                     future_dates = df[df.index >= today_utc]
                     if not future_dates.empty:
                         events["earnings_date"] = future_dates.index.min().strftime("%Y-%m-%d")
-            
-            # Extract recent news headlines while we have the yfinance object
-            if t.news:
-                events["news_headlines"] = parse_news_headlines(t.news)
+        except Exception as e:
+            print(f"Error fetching earnings date for {ticker}: {e}")
+
+    # Recent news headlines are fetched regardless of which earnings source succeeded
+    try:
+        if t.news:
+            events["news_headlines"] = parse_news_headlines(t.news)
     except Exception as e:
-        print(f"Error fetching ticker events for {ticker}: {e}")
+        print(f"Error fetching news headlines for {ticker}: {e}")
 
     # 2. Calculate earnings proximity
     def calculate_earnings_proximity(earnings_date_str: str) -> dict:

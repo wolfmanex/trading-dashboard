@@ -670,6 +670,19 @@ with col_e2:
 with col_e3:
     st.metric("10Y Treasury Yield (^TNX)", f"{event_data.get('macro_tnx', 0.0)}%")
 
+days_until_earnings = event_data.get("days_until_earnings")
+proximity_flag = event_data.get("proximity_flag")
+if proximity_flag == "IMMEDIATE_BINARY_RISK":
+    st.error(
+        f"⚠️ Earnings in {days_until_earnings} day(s) ({event_data.get('earnings_date')}). "
+        "Holding through the release is a binary event: consider closing or hedging with defined-risk structures."
+    )
+elif proximity_flag == "SWING_WINDOW_OVERLAP":
+    st.warning(
+        f"⏳ Earnings in {days_until_earnings} days ({event_data.get('earnings_date')}) overlap a typical swing window. "
+        "Plan the exit before the report and expect IV expansion followed by IV crush."
+    )
+
 with st.expander("📰 Recent Catalyst Headlines", expanded=False):
     if event_data.get("news_headlines"):
         for headline in event_data["news_headlines"]:
@@ -817,10 +830,11 @@ if st.session_state.llm_analysis:
         # --- Multi-Factor Breakdown Section ---
         st.markdown("### 🔬 Multi-Factor Analysis Breakdown")
         
-        tab_tech, tab_macro, tab_news = st.tabs([
-            "📊 Technical Structure", 
-            "🌐 Macro Regime & Risk", 
-            "📰 Catalysts & Headlines"
+        tab_tech, tab_macro, tab_news, tab_scenarios = st.tabs([
+            "📊 Technical Structure",
+            "🌐 Macro Regime & Risk",
+            "📰 Catalysts & Headlines",
+            "🎲 Catalyst Scenarios"
         ])
         
         with tab_tech:
@@ -844,6 +858,9 @@ if st.session_state.llm_analysis:
 
         with tab_news:
             st.markdown(sanitize_ai_text(res.get('news_catalyst_analysis', 'N/A')))
+
+        with tab_scenarios:
+            st.markdown(sanitize_ai_text(res.get('catalyst_scenarios', 'N/A')))
 
         st.markdown("<br>", unsafe_allow_html=True)
 
