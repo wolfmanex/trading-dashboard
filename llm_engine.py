@@ -1,21 +1,17 @@
-import os
 import json
 import math
 import pandas as pd
 import streamlit as st
 from google import genai
 
-
-def get_configured_secret(name: str):
-    """Read a Streamlit secret when available, then fall back to the environment."""
-    try:
-        return st.secrets.get(name) or os.getenv(name)
-    except Exception:
-        return os.getenv(name)
+from secrets_config import get_configured_secret
 
 
 # Initialize Google Generative AI Client
 api_key = get_configured_secret("GEMINI_API_KEY")
+# "gemini-flash-latest" follows Google's newest Flash model, so output can change without a code
+# change; set GEMINI_MODEL in secrets (e.g. a dated model name) to pin it.
+GEMINI_MODEL = get_configured_secret("GEMINI_MODEL", "gemini-flash-latest")
 gemini_client = genai.Client(api_key=api_key) if api_key else None
 
 
@@ -311,7 +307,7 @@ Synthesize all data and output strictly a SINGLE valid JSON object matching this
             raise RuntimeError("GEMINI_API_KEY is not configured")
 
         response = gemini_client.models.generate_content(
-            model="gemini-flash-latest",
+            model=GEMINI_MODEL,
             contents=prompt,
             config={"temperature": 0.2},
         )
@@ -349,7 +345,7 @@ def generate_ai_analysis(ticker: str, df: pd.DataFrame) -> str:
             raise RuntimeError("GEMINI_API_KEY is not configured")
 
         resp = gemini_client.models.generate_content(
-            model="gemini-flash-latest",
+            model=GEMINI_MODEL,
             contents=prompt,
         )
         return resp.text
@@ -460,7 +456,7 @@ Output strictly one JSON object, with one review per candidate, matching this sc
             raise RuntimeError("GEMINI_API_KEY is not configured")
 
         response = gemini_client.models.generate_content(
-            model="gemini-flash-latest",
+            model=GEMINI_MODEL,
             contents=prompt,
             config={"temperature": 0.2, "response_mime_type": "application/json"},
         )
