@@ -496,7 +496,7 @@ with scanner_tab:
     scan_results = st.session_state.scanner_results
     if scan_results is not None and scan_results.attrs.get("universe_source") == "fallback list":
         st.warning(
-            "The Yahoo screener is unavailable, so this scan used a built-in list of "
+            "No small-cap screener answered, so this scan used a built-in list of "
             f"{scan_results.attrs.get('universe_size', 'N/A')} small caps whose market caps are not re-checked. "
             f"Screener error: {scan_results.attrs.get('screener_error')}"
         )
@@ -509,7 +509,8 @@ with scanner_tab:
     else:
         st.caption(
             f"{len(scan_results)} setups | {scan_results.attrs.get('analyzed', 'N/A')} of "
-            f"{scan_results.attrs.get('universe_size', 'N/A')} stocks analyzed | "
+            f"{scan_results.attrs.get('universe_size', 'N/A')} stocks analyzed "
+            f"(from {scan_results.attrs.get('universe_source', 'N/A')}) | "
             f"{scan_results.attrs.get('scan_timestamp', '')} | Click a row to load it into the dashboard."
         )
         reviews = st.session_state.scanner_reviews
