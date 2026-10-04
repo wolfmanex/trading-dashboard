@@ -484,12 +484,25 @@ with scanner_tab:
     with scan_btn_col:
         if st.button("🔎 Run Breakout Scan", width="stretch"):
             with st.spinner("Screening small caps and measuring bases (this can take up to a minute)..."):
-                st.session_state.scanner_results = scan_smallcap_breakouts()
+                try:
+                    st.session_state.scanner_results = scan_smallcap_breakouts()
+                    st.session_state.scanner_error = None
+                except Exception as error:
+                    st.session_state.scanner_results = None
+                    st.session_state.scanner_error = str(error)
             st.session_state.scanner_reviews = {}
             st.session_state.scanner_review_error = None
 
     scan_results = st.session_state.scanner_results
-    if scan_results is None:
+    if scan_results is not None and scan_results.attrs.get("universe_source") == "fallback list":
+        st.warning(
+            "The Yahoo screener is unavailable, so this scan used a built-in list of "
+            f"{scan_results.attrs.get('universe_size', 'N/A')} small caps whose market caps are not re-checked. "
+            f"Screener error: {scan_results.attrs.get('screener_error')}"
+        )
+    if scan_results is None and st.session_state.get("scanner_error"):
+        st.error(f"Breakout scan failed: {st.session_state.scanner_error}")
+    elif scan_results is None:
         st.info("Run the scan to find small caps setting up for a breakout. Results are cached for 15 minutes.")
     elif scan_results.empty:
         st.warning(scan_results.attrs.get("error") or "No small caps currently meet the breakout and reward/risk criteria.")
