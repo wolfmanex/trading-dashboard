@@ -8,7 +8,7 @@ def run_ta_backtest(
     holding_period: int = 5,
     cost_per_trade_pct: float = 0.0,
 ) -> dict:
-    """Evaluate the deterministic TA score with next-bar entry and fixed exit."""
+    """Evaluate the deterministic TA score with next-bar entry, fixed exit, and no overlapping trades."""
     result = {
         "total_trades": 0,
         "win_rate_pct": "N/A",
@@ -25,24 +25,33 @@ def run_ta_backtest(
         return result
 
     returns = []
-    for index in range(len(df) - holding_period):
+    index = 0
+    last_signal_index = len(df) - holding_period
+    while index < last_signal_index:
         signal_row = df.iloc[index]
         if signal_row[list(required_columns)].isna().any():
+            index += 1
             continue
 
         score = calculate_ta_score(df.iloc[[index]])
         if abs(score) < 50:
+            index += 1
             continue
 
+        exit_index = index + holding_period
         entry_price = float(df["Close"].iloc[index + 1])
-        exit_price = float(df["Close"].iloc[index + holding_period])
+        exit_price = float(df["Close"].iloc[exit_index])
         if entry_price <= 0 or exit_price <= 0:
+            index += 1
             continue
 
         direction = 1 if score >= 50 else -1
         gross_return = direction * ((exit_price - entry_price) / entry_price)
         net_return = gross_return - (cost_per_trade_pct / 100)
         returns.append(net_return)
+
+        # One position at a time: the next signal is evaluated from the exit bar onward
+        index = exit_index
 
     if not returns:
         return result

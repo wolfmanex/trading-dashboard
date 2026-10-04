@@ -136,8 +136,25 @@ class TechnicalEngineTests(unittest.TestCase):
 
         result = run_ta_backtest(data, holding_period=2)
 
-        self.assertEqual(result["total_trades"], 4)
+        # Signals at bars 1 and 3 (bar 0 closes on EMA 21); the second waits for the first exit
+        self.assertEqual(result["total_trades"], 2)
         self.assertEqual(result["win_rate_pct"], 100.0)
+
+    def test_backtest_does_not_open_overlapping_trades(self):
+        data = pd.DataFrame({
+            "Close": [100.0, 100.0, 110.0, 121.0, 133.1, 146.41, 161.051],
+            "EMA_9": [100.0] * 7,
+            "EMA_21": [99.0] * 7,
+            "MACD": [2.0] * 7,
+            "Signal_Line": [1.0] * 7,
+            "RSI": [50.0] * 7,
+        })
+
+        result = run_ta_backtest(data, holding_period=3)
+
+        # Signals at bars 0 and 3 only: entry 1 -> exit 3, then entry 4 -> exit 6
+        self.assertEqual(result["total_trades"], 2)
+        self.assertAlmostEqual(result["cumulative_return_pct"], (1.21 * 1.21 - 1) * 100, places=2)
 
     def test_backtest_applies_cost_per_trade(self):
         data = pd.DataFrame({
