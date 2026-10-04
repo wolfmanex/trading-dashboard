@@ -4,7 +4,8 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import streamlit as st
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 # Safely import Alpaca if installed
 try:
@@ -270,6 +271,67 @@ def get_multi_timeframe_data(ticker: str):
     return df_5m, df_4h, df_1d
 
 
+EASTERN = ZoneInfo("America/New_York")
+INTRADAY_TIMEFRAMES = {"5m", "15m", "1h"}
+BAR_DURATIONS = {
+    "5m": timedelta(minutes=5),
+    "15m": timedelta(minutes=15),
+    "1h": timedelta(hours=1),
+    "1d": timedelta(days=1),
+    "1w": timedelta(days=7),
+}
+
+
+def get_market_session(ticker: str, now: datetime = None) -> str:
+    """Return REGULAR, PRE, POST or CLOSED for the ticker's market at `now` (US/Eastern).
+
+    Crypto trades around the clock and FX from Sunday 17:00 to Friday 17:00 ET. US stocks use
+    the 9:30-16:00 regular session with 4:00 pre-market and 20:00 after-hours bounds; exchange
+    holidays are not modelled, so a holiday reads as a normal weekday.
+    """
+    ticker = ticker.strip().upper()
+    now = (now or datetime.now(EASTERN)).astimezone(EASTERN)
+    if ticker.endswith("-USD"):
+        return "REGULAR"
+    weekday, clock = now.weekday(), now.time()
+    if ticker.endswith("=X"):
+        if weekday == 5 or (weekday == 6 and clock < time(17)) or (weekday == 4 and clock >= time(17)):
+            return "CLOSED"
+        return "REGULAR"
+    if weekday >= 5:
+        return "CLOSED"
+    if time(9, 30) <= clock < time(16):
+        return "REGULAR"
+    if time(4) <= clock < time(9, 30):
+        return "PRE"
+    if time(16) <= clock < time(20):
+        return "POST"
+    return "CLOSED"
+
+
+def should_apply_live_price(last_candle, timeframe: str, session: str, now: datetime = None) -> bool:
+    """Decide whether a live quote may overwrite the last candle.
+
+    Only a current candle is updated (one that started less than one bar ago), so a quote never
+    lands in yesterday's bar. Daily and weekly bars are regular-session bars, so pre-market and
+    after-hours quotes only update intraday candles (which the feed loads with extended hours).
+    """
+    if session == "CLOSED" or timeframe not in BAR_DURATIONS:
+        return False
+    if session != "REGULAR" and timeframe not in INTRADAY_TIMEFRAMES:
+        return False
+    try:
+        candle_start = pd.Timestamp(last_candle)
+    except (TypeError, ValueError):
+        return False
+    if candle_start.tzinfo is not None:
+        candle_start = candle_start.tz_convert(EASTERN).tz_localize(None)
+    now_eastern = (now or datetime.now(EASTERN)).astimezone(EASTERN).replace(tzinfo=None)
+    age = pd.Timestamp(now_eastern) - candle_start
+    return timedelta(0) <= age < BAR_DURATIONS[timeframe]
+
+
+@st.cache_data(ttl=30, show_spinner=False)
 def get_live_price(ticker: str) -> float:
     """Fetches live price using yfinance (Primary), CNBC (Secondary), and Twelve Data (Tertiary)."""
     ticker = ticker.strip().upper()

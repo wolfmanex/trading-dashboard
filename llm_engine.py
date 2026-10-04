@@ -93,6 +93,77 @@ def validate_synthesis_result(result: dict) -> dict:
     return result
 
 
+MAX_LEVEL_DISTANCE = 0.30  # plan levels further than this from the current price are flagged
+
+
+def parse_plan_level(value):
+    """Read a plan level that may be a number, a numeric string, or an 'a - b' zone (midpoint)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) and value > 0 else None
+    if not isinstance(value, str):
+        return None
+    parts = [part.strip().replace(",", "").replace("USD", "").replace("$", "").strip()
+             for part in value.replace("–", "-").split(" - ")]
+    try:
+        numbers = [float(part) for part in parts if part]
+    except ValueError:
+        return None
+    if not numbers or any(number <= 0 for number in numbers):
+        return None
+    return sum(numbers) / len(numbers)
+
+
+def check_execution_plan(result: dict, current_price: float) -> list:
+    """Return human-readable problems with the AI trade plan's levels; an empty list means it passed.
+
+    Checks that BUY plans have stop < entry < target (SELL the reverse), that levels sit near the
+    current price, and that the stated risk/reward matches the levels.
+    """
+    if not isinstance(result, dict):
+        return []
+    plan = result.get("execution_plan") or {}
+    signal = str(result.get("signal", "HOLD")).upper()
+    entry = parse_plan_level(plan.get("entry_zone"))
+    stop = parse_plan_level(plan.get("stop_loss"))
+    target = parse_plan_level(plan.get("take_profit"))
+    issues = []
+
+    if signal in {"BUY", "SELL"}:
+        missing = [name for name, value in (("entry", entry), ("stop loss", stop), ("take profit", target)) if value is None]
+        if missing:
+            issues.append(f"The plan has no usable {', '.join(missing)} level.")
+        elif signal == "BUY" and not stop < entry < target:
+            issues.append(
+                f"A BUY needs stop < entry < target, but the plan has stop {stop:.2f}, entry {entry:.2f}, target {target:.2f}."
+            )
+        elif signal == "SELL" and not target < entry < stop:
+            issues.append(
+                f"A SELL needs target < entry < stop, but the plan has target {target:.2f}, entry {entry:.2f}, stop {stop:.2f}."
+            )
+        else:
+            stated = str(plan.get("risk_reward_ratio", ""))
+            actual = abs(target - entry) / abs(entry - stop)
+            stated_parts = stated.replace(" ", "").split(":")
+            try:
+                stated_ratio = float(stated_parts[1]) / float(stated_parts[0]) if len(stated_parts) == 2 else float(stated)
+            except (ValueError, ZeroDivisionError):
+                stated_ratio = None
+            if stated_ratio is not None and abs(stated_ratio - actual) > max(0.3, 0.25 * actual):
+                issues.append(
+                    f"The stated risk/reward ({stated}) does not match the levels, which give 1:{actual:.1f}."
+                )
+
+    if current_price and current_price > 0:
+        for name, value in (("Entry", entry), ("Stop loss", stop), ("Take profit", target)):
+            if value is not None and abs(value - current_price) / current_price > MAX_LEVEL_DISTANCE:
+                issues.append(
+                    f"{name} {value:.2f} is {abs(value - current_price) / current_price:.0%} away from the current price {current_price:.2f}."
+                )
+    return issues
+
+
 def synthesize_signals(
     ticker: str, 
     df_5m: pd.DataFrame = None, 
