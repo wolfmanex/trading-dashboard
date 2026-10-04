@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from breakout_engine import analyze_breakout_setup, find_base, qualifies, rank_breakout_candidates, score_setup
-from llm_engine import validate_breakout_reviews
+from llm_engine import format_breakout_candidate, validate_breakout_reviews
 from smallcap_screener import parse_screener_quotes
 
 
@@ -182,6 +182,25 @@ class BreakoutReviewValidationTests(unittest.TestCase):
     def test_missing_reviews_list_is_rejected(self):
         with self.assertRaises(ValueError):
             validate_breakout_reviews({"signal": "BUY"}, ["ABCD"])
+
+
+class BreakoutCandidateFormatTests(unittest.TestCase):
+    CANDIDATE = {
+        "Ticker": "ABCD", "Name": "Abcd Inc", "Price": 20.3, "Market Cap": 900_000_000, "Pivot": 20.0,
+        "To Pivot": 3.5, "Stop": 18.5, "Target": 25.0, "Reward/Risk": 3.3, "Base Weeks": 6.0,
+        "Base Depth": 20.0, "RVOL": 1.2, "RS vs IWM": 8.0, "Breakout Score": 70.0,
+    }
+
+    def test_pivot_below_price_is_described_as_distance_to_go(self):
+        block = format_breakout_candidate(self.CANDIDATE, {})
+
+        self.assertIn("20.0 USD, 3.5% above price", block)
+
+    def test_extended_price_is_not_described_as_negative_distance(self):
+        block = format_breakout_candidate({**self.CANDIDATE, "To Pivot": -1.5}, {})
+
+        self.assertIn("20.0 USD, price already 1.5% above it", block)
+        self.assertNotIn("-1.5%", block)
 
 
 if __name__ == "__main__":

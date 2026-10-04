@@ -322,10 +322,12 @@ def validate_breakout_reviews(result: dict, candidate_tickers) -> dict:
 def format_breakout_candidate(candidate: dict, context: dict) -> str:
     headlines = context.get("headlines") or []
     headlines_str = "\n".join(f"    {headline}" for headline in headlines) or "    No recent headlines."
+    to_pivot = candidate["To Pivot"]
+    pivot_position = f"{to_pivot}% above price" if to_pivot >= 0 else f"price already {abs(to_pivot)}% above it"
     return f"""#### {candidate['Ticker']} ({candidate.get('Name', '')})
 - Sector / Industry: {context.get('sector', 'N/A')} / {context.get('industry', 'N/A')}
 - Price: {candidate['Price']} USD | Market Cap: {candidate.get('Market Cap', 'N/A')} USD
-- Pivot (buy-stop): {candidate['Pivot']} USD, {candidate['To Pivot']}% above price
+- Pivot (buy-stop): {candidate['Pivot']} USD, {pivot_position}
 - Stop: {candidate['Stop']} USD | Measured-move Target: {candidate['Target']} USD | Reward/Risk: {candidate['Reward/Risk']}
 - Base: {candidate['Base Weeks']} weeks, {candidate['Base Depth']}% deep | Latest RVOL: {candidate['RVOL']}
 - 3-month Relative Strength vs IWM: {candidate['RS vs IWM']}% | Breakout Score: {candidate['Breakout Score']}/100
