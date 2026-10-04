@@ -1,11 +1,13 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 import pandas as pd
 
 from breakout_engine import analyze_breakout_setup, find_base, qualifies, rank_breakout_candidates, score_setup
 from llm_engine import format_breakout_candidate, validate_breakout_reviews
-from smallcap_screener import parse_screener_quotes
+import smallcap_screener
+from smallcap_screener import FALLBACK_SMALLCAPS, parse_screener_quotes
 
 
 def make_frame(closes, volumes=None, spread=0.01):
@@ -151,6 +153,54 @@ class ScreenerParsingTests(unittest.TestCase):
     def test_malformed_response_returns_empty_universe(self):
         self.assertEqual(parse_screener_quotes(None), {})
         self.assertEqual(parse_screener_quotes({"quotes": None}), {})
+
+
+class ScreenerFallbackTests(unittest.TestCase):
+    def setUp(self):
+        smallcap_screener.get_smallcap_universe.clear()
+        smallcap_screener.scan_smallcap_breakouts.clear()
+
+    def test_bounds_drop_quotes_outside_small_cap_range(self):
+        response = {"quotes": [
+            {"symbol": "IN", "marketCap": 900_000_000, "regularMarketPrice": 12.0},
+            {"symbol": "BIG", "marketCap": 9_000_000_000, "regularMarketPrice": 50.0},
+            {"symbol": "PENNY", "marketCap": 500_000_000, "regularMarketPrice": 0.8},
+            {"symbol": "NOCAP", "regularMarketPrice": 10.0},
+        ]}
+        self.assertEqual(list(parse_screener_quotes(response, apply_bounds=True)), ["IN"])
+
+    def test_universe_falls_through_to_next_screener_attempt(self):
+        quotes = {"quotes": [{"symbol": "ABC", "marketCap": 800_000_000, "regularMarketPrice": 9.0}]}
+        with mock.patch("yfinance.screen", side_effect=[Exception("400 Bad Request"), quotes]) as screen:
+            universe = smallcap_screener.get_smallcap_universe()
+        self.assertEqual(list(universe), ["ABC"])
+        self.assertEqual(screen.call_count, 2)
+
+    def test_universe_raises_when_every_attempt_fails_so_failure_is_not_cached(self):
+        with mock.patch("yfinance.screen", side_effect=Exception("401 Invalid Crumb")):
+            with self.assertRaisesRegex(RuntimeError, "Invalid Crumb"):
+                smallcap_screener.get_smallcap_universe()
+        quotes = {"quotes": [{"symbol": "ABC", "marketCap": 800_000_000}]}
+        with mock.patch("yfinance.screen", return_value=quotes):
+            self.assertEqual(list(smallcap_screener.get_smallcap_universe()), ["ABC"])
+
+    def test_scan_uses_fallback_list_when_screener_is_unavailable(self):
+        frames = {ticker: make_frame(np.linspace(10, 12, 260)) for ticker in FALLBACK_SMALLCAPS + ["IWM"]}
+        batch = pd.concat(frames, axis=1)
+        with mock.patch("yfinance.screen", side_effect=Exception("401 Invalid Crumb")), \
+                mock.patch("yfinance.download", return_value=batch) as download:
+            result = smallcap_screener.scan_smallcap_breakouts()
+        self.assertEqual(result.attrs["universe_source"], "fallback list")
+        self.assertIn("Invalid Crumb", result.attrs["screener_error"])
+        self.assertEqual(result.attrs["universe_size"], len(FALLBACK_SMALLCAPS))
+        self.assertEqual(set(download.call_args.kwargs["tickers"]), set(FALLBACK_SMALLCAPS) | {"IWM"})
+
+    def test_scan_raises_when_no_prices_download(self):
+        quotes = {"quotes": [{"symbol": "ABC", "marketCap": 800_000_000}]}
+        with mock.patch("yfinance.screen", return_value=quotes), \
+                mock.patch("yfinance.download", return_value=pd.DataFrame()):
+            with self.assertRaisesRegex(RuntimeError, "No price data"):
+                smallcap_screener.scan_smallcap_breakouts()
 
 
 class BreakoutReviewValidationTests(unittest.TestCase):
