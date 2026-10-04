@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 from yfinance import EquityQuery
@@ -29,8 +30,7 @@ def build_smallcap_query() -> EquityQuery:
     ])
 
 
-# Used only when the Yahoo screener is unreachable (it needs a cookie/crumb that cloud hosts often fail
-# to get). Market caps drift, so these are re-checked by the scan's dollar-volume and setup filters.
+# Used only when no screener source answers. Market caps drift, so these are re-checked by the scan's dollar-volume and setup filters.
 FALLBACK_SMALLCAPS = [
     "AAOI", "AEHR", "AEO", "AMC", "AMPL", "ARCT", "ARRY", "BBAI", "BLDP", "BMBL",
     "BTBT", "CARS", "CLOV", "CRSR", "DNUT", "EVGO", "FIGS", "FUBO", "GOGO", "GPRE",
@@ -39,13 +39,17 @@ FALLBACK_SMALLCAPS = [
     "TDOC", "VSAT", "BEAM", "WULF",
 ]
 
-# Tried in order: the custom query sorted by liquidity, the same query with a basic sort field,
-# then Yahoo's predefined small-cap screen with the price and market-cap bounds applied locally.
-SCREENER_ATTEMPTS = (
-    ("custom", "avgdailyvol3m"),
-    ("custom", "dayvolume"),
-    ("small_cap_gainers", None),
-)
+MAX_UNIVERSE = 500
+NASDAQ_SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks"
+NASDAQ_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://www.nasdaq.com",
+    "Referer": "https://www.nasdaq.com/",
+}
 
 
 def parse_screener_quotes(response, apply_bounds: bool = False) -> dict:
@@ -72,43 +76,102 @@ def parse_screener_quotes(response, apply_bounds: bool = False) -> dict:
     return universe
 
 
-def _screen_page(attempt, offset: int, page_size: int):
-    query_name, sort_field = attempt
-    if query_name == "custom":
-        return yf.screen(
+def _parse_number(value):
+    """Turn Nasdaq display strings like "$12.34", "1,234,567" or "" into floats (None when blank)."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").replace("$", "").replace(",", "").strip()
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def parse_nasdaq_rows(payload, limit: int = MAX_UNIVERSE) -> dict:
+    """Filter Nasdaq's all-US-stocks screener to small caps, keeping the most traded by dollar volume."""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    data = data if isinstance(data, dict) else {}
+    rows = data.get("rows") or (data.get("table") or {}).get("rows") or []
+    candidates = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol", "")).strip().upper()
+        # Skip preferreds, units, warrants and share classes ("ABC^A", "ABC/WS", "BRK.B").
+        if not symbol or any(char in symbol for char in "^/. "):
+            continue
+        market_cap = _parse_number(row.get("marketCap"))
+        price = _parse_number(row.get("lastsale"))
+        volume = _parse_number(row.get("volume"))
+        if market_cap is None or not MIN_MARKET_CAP <= market_cap <= MAX_MARKET_CAP:
+            continue
+        if price is None or price < MIN_PRICE or volume is None or volume < MIN_AVG_SHARE_VOLUME:
+            continue
+        candidates.append((price * volume, symbol, row.get("name") or symbol, market_cap))
+    candidates.sort(reverse=True)
+    return {
+        symbol: {"name": name, "market_cap": market_cap}
+        for _, symbol, name, market_cap in candidates[:limit]
+    }
+
+
+def _yahoo_custom_universe(pages: int = 2, page_size: int = 250) -> dict:
+    universe = {}
+    for page in range(pages):
+        response = yf.screen(
             build_smallcap_query(),
-            offset=offset,
+            offset=page * page_size,
             size=page_size,
             count=page_size,
-            sortField=sort_field,
+            sortField="avgdailyvol3m",
             sortAsc=False,
         )
-    return yf.screen(query_name, offset=offset, count=page_size)
+        universe.update(parse_screener_quotes(response))
+        if len(response.get("quotes") or []) < page_size:
+            break
+    return universe
+
+
+def _nasdaq_universe() -> dict:
+    # Nasdaq's public screener needs no cookie or crumb, unlike Yahoo's, which returns 401 from cloud hosts.
+    response = requests.get(
+        NASDAQ_SCREENER_URL,
+        params={"tableonly": "true", "download": "true"},
+        headers=NASDAQ_HEADERS,
+        timeout=20,
+    )
+    response.raise_for_status()
+    return parse_nasdaq_rows(response.json())
+
+
+def _yahoo_predefined_universe() -> dict:
+    # Without an offset yfinance uses the GET endpoint for predefined screens rather than the POST one.
+    return parse_screener_quotes(yf.screen("small_cap_gainers", count=250), apply_bounds=True)
+
+
+UNIVERSE_SOURCES = (
+    ("Yahoo screener", _yahoo_custom_universe),
+    ("Nasdaq screener", _nasdaq_universe),
+    ("Yahoo small-cap screen", _yahoo_predefined_universe),
+)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_smallcap_universe(pages: int = 2, page_size: int = 250) -> dict:
-    """Most liquid US small caps from the Yahoo screener.
+def get_smallcap_universe() -> tuple:
+    """Return (source name, {ticker: {name, market_cap}}) from the first small-cap source that answers.
 
-    Raises RuntimeError when every screener attempt fails, so a failure is never cached for an hour.
+    Raises RuntimeError when every source fails, so a failure is never cached for an hour.
     """
     errors = []
-    for attempt in SCREENER_ATTEMPTS:
-        label = f"{attempt[0]} sorted by {attempt[1] or 'default'}"
-        universe = {}
-        problem = "no quotes returned"
-        for page in range(pages):
-            try:
-                response = _screen_page(attempt, page * page_size, page_size)
-            except Exception as error:
-                problem = str(error)
-                break
-            universe.update(parse_screener_quotes(response, apply_bounds=attempt[0] != "custom"))
-            if len(response.get("quotes") or []) < page_size:
-                break
+    for name, fetch in UNIVERSE_SOURCES:
+        try:
+            universe = fetch()
+        except Exception as error:
+            errors.append(f"{name}: {error}")
+            continue
         if universe:
-            return universe
-        errors.append(f"{label}: {problem}")
+            return name, universe
+        errors.append(f"{name}: no stocks returned")
     raise RuntimeError("; ".join(errors))
 
 
@@ -129,10 +192,9 @@ def scan_smallcap_breakouts(
     limit: int = 25,
 ) -> pd.DataFrame:
     """Screen the small-cap universe for base-breakout setups using one batched daily download."""
-    universe_source = "Yahoo screener"
     screener_error = None
     try:
-        universe = get_smallcap_universe()
+        universe_source, universe = get_smallcap_universe()
     except Exception as error:
         print(f"Small-cap screener unavailable, using fallback list: {error}")
         screener_error = str(error)

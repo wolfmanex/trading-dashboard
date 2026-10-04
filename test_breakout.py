@@ -169,31 +169,84 @@ class ScreenerFallbackTests(unittest.TestCase):
         ]}
         self.assertEqual(list(parse_screener_quotes(response, apply_bounds=True)), ["IN"])
 
-    def test_universe_falls_through_to_next_screener_attempt(self):
-        quotes = {"quotes": [{"symbol": "ABC", "marketCap": 800_000_000, "regularMarketPrice": 9.0}]}
-        with mock.patch("yfinance.screen", side_effect=[Exception("400 Bad Request"), quotes]) as screen:
-            universe = smallcap_screener.get_smallcap_universe()
-        self.assertEqual(list(universe), ["ABC"])
-        self.assertEqual(screen.call_count, 2)
+    def nasdaq_payload(self):
+        return {"data": {"rows": [
+            {"symbol": "LIQ", "name": "Liquid Co", "lastsale": "$20.00", "volume": "2,000,000", "marketCap": "1,500,000,000.00"},
+            {"symbol": "THIN", "name": "Thin Co", "lastsale": "$5.00", "volume": "400,000", "marketCap": "800,000,000.00"},
+            {"symbol": "LOWVOL", "name": "Quiet Co", "lastsale": "$30.00", "volume": "1,000", "marketCap": "900,000,000.00"},
+            {"symbol": "MEGA", "name": "Mega Co", "lastsale": "$300.00", "volume": "9,000,000", "marketCap": "900,000,000,000.00"},
+            {"symbol": "PENNY", "name": "Penny Co", "lastsale": "$1.20", "volume": "9,000,000", "marketCap": "400,000,000.00"},
+            {"symbol": "ABC^A", "name": "ABC Preferred", "lastsale": "$25.00", "volume": "900,000", "marketCap": "1,000,000,000.00"},
+            {"symbol": "NOCAP", "name": "No Cap", "lastsale": "$10.00", "volume": "900,000", "marketCap": ""},
+        ]}}
 
-    def test_universe_raises_when_every_attempt_fails_so_failure_is_not_cached(self):
-        with mock.patch("yfinance.screen", side_effect=Exception("401 Invalid Crumb")):
-            with self.assertRaisesRegex(RuntimeError, "Invalid Crumb"):
+    def nasdaq_response(self):
+        response = mock.Mock()
+        response.json.return_value = self.nasdaq_payload()
+        response.raise_for_status.return_value = None
+        return response
+
+    def test_nasdaq_rows_keep_liquid_small_caps_ranked_by_dollar_volume(self):
+        universe = smallcap_screener.parse_nasdaq_rows(self.nasdaq_payload())
+        self.assertEqual(list(universe), ["LIQ", "THIN"])
+        self.assertEqual(universe["LIQ"], {"name": "Liquid Co", "market_cap": 1_500_000_000.0})
+        self.assertEqual(list(smallcap_screener.parse_nasdaq_rows(self.nasdaq_payload(), limit=1)), ["LIQ"])
+
+    def test_nasdaq_rows_tolerate_malformed_payloads(self):
+        self.assertEqual(smallcap_screener.parse_nasdaq_rows(None), {})
+        self.assertEqual(smallcap_screener.parse_nasdaq_rows({"data": None}), {})
+        self.assertEqual(smallcap_screener.parse_nasdaq_rows({"data": {"rows": [None, "x"]}}), {})
+
+    def test_universe_uses_nasdaq_when_yahoo_returns_401(self):
+        with mock.patch("yfinance.screen", side_effect=Exception("401 Client Error: Unauthorized")) as screen, \
+                mock.patch("requests.get", return_value=self.nasdaq_response()):
+            source, universe = smallcap_screener.get_smallcap_universe()
+        self.assertEqual(source, "Nasdaq screener")
+        self.assertEqual(list(universe), ["LIQ", "THIN"])
+        self.assertEqual(screen.call_count, 1)
+
+    def test_predefined_yahoo_screen_uses_get_endpoint_without_offset(self):
+        quotes = {"quotes": [{"symbol": "ABC", "marketCap": 800_000_000, "regularMarketPrice": 9.0}]}
+        with mock.patch("yfinance.screen", side_effect=[Exception("401"), quotes]) as screen, \
+                mock.patch("requests.get", side_effect=Exception("403 Forbidden")):
+            source, universe = smallcap_screener.get_smallcap_universe()
+        self.assertEqual(source, "Yahoo small-cap screen")
+        self.assertEqual(list(universe), ["ABC"])
+        self.assertEqual(screen.call_args.args, ("small_cap_gainers",))
+        self.assertNotIn("offset", screen.call_args.kwargs)
+
+    def test_universe_raises_when_every_source_fails_so_failure_is_not_cached(self):
+        with mock.patch("yfinance.screen", side_effect=Exception("401 Invalid Crumb")), \
+                mock.patch("requests.get", side_effect=Exception("403 Forbidden")):
+            with self.assertRaisesRegex(RuntimeError, "Invalid Crumb.*403 Forbidden"):
                 smallcap_screener.get_smallcap_universe()
         quotes = {"quotes": [{"symbol": "ABC", "marketCap": 800_000_000}]}
         with mock.patch("yfinance.screen", return_value=quotes):
-            self.assertEqual(list(smallcap_screener.get_smallcap_universe()), ["ABC"])
+            self.assertEqual(smallcap_screener.get_smallcap_universe(), ("Yahoo screener", {
+                "ABC": {"name": "ABC", "market_cap": 800_000_000},
+            }))
 
-    def test_scan_uses_fallback_list_when_screener_is_unavailable(self):
+    def test_scan_uses_fallback_list_when_every_source_fails(self):
         frames = {ticker: make_frame(np.linspace(10, 12, 260)) for ticker in FALLBACK_SMALLCAPS + ["IWM"]}
         batch = pd.concat(frames, axis=1)
         with mock.patch("yfinance.screen", side_effect=Exception("401 Invalid Crumb")), \
+                mock.patch("requests.get", side_effect=Exception("403 Forbidden")), \
                 mock.patch("yfinance.download", return_value=batch) as download:
             result = smallcap_screener.scan_smallcap_breakouts()
         self.assertEqual(result.attrs["universe_source"], "fallback list")
         self.assertIn("Invalid Crumb", result.attrs["screener_error"])
         self.assertEqual(result.attrs["universe_size"], len(FALLBACK_SMALLCAPS))
         self.assertEqual(set(download.call_args.kwargs["tickers"]), set(FALLBACK_SMALLCAPS) | {"IWM"})
+
+    def test_scan_records_nasdaq_as_universe_source(self):
+        batch = pd.concat({ticker: make_frame(np.linspace(10, 12, 260)) for ticker in ["LIQ", "THIN", "IWM"]}, axis=1)
+        with mock.patch("yfinance.screen", side_effect=Exception("401")), \
+                mock.patch("requests.get", return_value=self.nasdaq_response()), \
+                mock.patch("yfinance.download", return_value=batch):
+            result = smallcap_screener.scan_smallcap_breakouts()
+        self.assertEqual(result.attrs["universe_source"], "Nasdaq screener")
+        self.assertIsNone(result.attrs["screener_error"])
+        self.assertEqual(result.attrs["universe_size"], 2)
 
     def test_scan_raises_when_no_prices_download(self):
         quotes = {"quotes": [{"symbol": "ABC", "marketCap": 800_000_000}]}
