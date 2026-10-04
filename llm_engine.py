@@ -284,3 +284,117 @@ def generate_ai_analysis(ticker: str, df: pd.DataFrame) -> str:
         return resp.text
     except Exception as e:
         return f"Analysis unavailable: {e}"
+
+BREAKOUT_GRADES = {"A", "B", "C"}
+BREAKOUT_RISK_LEVELS = {"LOW", "MEDIUM", "HIGH", "EXTREME"}
+
+
+def validate_breakout_reviews(result: dict, candidate_tickers) -> dict:
+    """Keep only well-formed reviews for tickers that were actually sent to the model."""
+    if not isinstance(result, dict) or not isinstance(result.get("reviews"), list):
+        raise ValueError("AI breakout response must contain a 'reviews' list")
+
+    allowed = {str(ticker).upper() for ticker in candidate_tickers}
+    reviews = {}
+    for review in result["reviews"]:
+        if not isinstance(review, dict):
+            continue
+        ticker = str(review.get("ticker", "")).strip().upper()
+        grade = str(review.get("grade", "")).strip().upper()
+        risk = str(review.get("risk_level", "")).strip().upper()
+        if ticker not in allowed or grade not in BREAKOUT_GRADES:
+            continue
+        red_flags = review.get("red_flags", [])
+        if isinstance(red_flags, str):
+            red_flags = [red_flags] if red_flags.strip() else []
+        elif not isinstance(red_flags, list):
+            red_flags = []
+        reviews[ticker] = {
+            "grade": grade,
+            "risk_level": risk if risk in BREAKOUT_RISK_LEVELS else "HIGH",
+            "catalyst": str(review.get("catalyst", "")).strip() or "None identified",
+            "thesis": str(review.get("thesis", "")).strip(),
+            "red_flags": [str(flag).strip() for flag in red_flags if str(flag).strip()],
+        }
+    return reviews
+
+
+def format_breakout_candidate(candidate: dict, context: dict) -> str:
+    headlines = context.get("headlines") or []
+    headlines_str = "\n".join(f"    {headline}" for headline in headlines) or "    No recent headlines."
+    return f"""#### {candidate['Ticker']} ({candidate.get('Name', '')})
+- Sector / Industry: {context.get('sector', 'N/A')} / {context.get('industry', 'N/A')}
+- Price: {candidate['Price']} USD | Market Cap: {candidate.get('Market Cap', 'N/A')} USD
+- Pivot (buy-stop): {candidate['Pivot']} USD, {candidate['To Pivot']}% above price
+- Stop: {candidate['Stop']} USD | Measured-move Target: {candidate['Target']} USD | Reward/Risk: {candidate['Reward/Risk']}
+- Base: {candidate['Base Weeks']} weeks, {candidate['Base Depth']}% deep | Latest RVOL: {candidate['RVOL']}
+- 3-month Relative Strength vs IWM: {candidate['RS vs IWM']}% | Breakout Score: {candidate['Breakout Score']}/100
+- Float: {context.get('float_shares', 'N/A')} shares | Short % of Float: {context.get('short_pct_float', 'N/A')} | Insider %: {context.get('insider_pct', 'N/A')}
+- Next Earnings Date: {context.get('earnings_date', 'N/A')} (today is {pd.Timestamp.today().strftime('%Y-%m-%d')})
+- Recent Headlines:
+{headlines_str}"""
+
+
+def review_breakout_candidates(candidates: list, contexts: dict) -> dict:
+    """Ask the model to grade pre-computed small-cap breakout setups and surface catalysts and red flags.
+
+    Returns {"reviews": {ticker: review}, "error": str | None}.
+    """
+    if not candidates:
+        return {"reviews": {}, "error": None}
+
+    candidate_blocks = "\n\n".join(
+        format_breakout_candidate(candidate, contexts.get(candidate["Ticker"], {}))
+        for candidate in candidates
+    )
+    prompt = f"""
+You are a small-cap equity analyst reviewing breakout setups that a quantitative screener has already found.
+The pivot, stop, target and reward/risk below were calculated in code from daily price data. Do not recompute
+or invent price levels. Your job is to judge the quality of each setup and the risks the numbers cannot show.
+
+For each candidate assess:
+1. Catalyst: is there a fundamental or news reason the stock could break out (earnings momentum, contract,
+   FDA decision, guidance raise, sector rotation)? Use only the headlines and data provided.
+2. Red flags typical of small caps: share offerings or dilution (ATM programs, S-3 shelves, convertible notes),
+   reverse splits, going-concern or delisting notices, promotional or pump-style news, very low float combined
+   with high short interest (squeeze-driven, unstable), or earnings falling within the next 10 trading days.
+3. Grade: A = clean setup with a supportive catalyst and no material red flags; B = valid setup with minor
+   concerns or no clear catalyst; C = setup undermined by red flags or binary event risk.
+4. Risk level: LOW, MEDIUM, HIGH or EXTREME.
+
+If information is missing, say so instead of guessing. Never use the '$' symbol; write prices as numbers or USD.
+
+### CANDIDATES
+{candidate_blocks}
+
+Output strictly one JSON object, with one review per candidate, matching this schema:
+{{
+  "reviews": [
+    {{
+      "ticker": "ABCD",
+      "grade": "B",
+      "risk_level": "HIGH",
+      "catalyst": "Short phrase naming the catalyst, or 'None identified'",
+      "thesis": "Two or three sentences on why the setup is or is not worth watching.",
+      "red_flags": ["Each concrete concern as a short phrase"]
+    }}
+  ]
+}}
+"""
+
+    try:
+        if gemini_client is None:
+            raise RuntimeError("GEMINI_API_KEY is not configured")
+
+        response = gemini_client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=prompt,
+            config={"temperature": 0.2, "response_mime_type": "application/json"},
+        )
+        clean_text = response.text.replace("```json", "").replace("```", "").strip()
+        result_json = json.loads(clean_text, strict=False)
+        reviews = validate_breakout_reviews(result_json, [c["Ticker"] for c in candidates])
+        return {"reviews": reviews, "error": None}
+    except Exception as e:
+        print(f"Breakout Review Engine Error: {e}")
+        return {"reviews": {}, "error": str(e)}
