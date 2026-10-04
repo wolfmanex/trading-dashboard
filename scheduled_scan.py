@@ -2,16 +2,23 @@
 
 Used by .github/workflows/scheduled-scan.yml. Results always go to stdout and, on GitHub Actions,
 to the job summary. When TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set they are also sent to
-Telegram.
+Telegram. With --log PATH the setups are also added to the signal log and every live signal's
+outcome is re-checked (see signal_log.py).
 """
+import argparse
 import os
 import sys
+from datetime import datetime, timedelta
 from html import escape
+from zoneinfo import ZoneInfo
 
+import pandas as pd
 import requests
+import yfinance as yf
 
 from earnings_engine import EARNINGS_WINDOW_DAYS, add_earnings_columns, get_upcoming_earnings
-from smallcap_screener import get_smallcap_regime, scan_smallcap_breakouts
+from signal_log import LIVE_STATUSES, append_signals, read_log, summarize_log, update_outcomes
+from smallcap_screener import BENCHMARK, _ticker_frame, get_smallcap_regime, scan_smallcap_breakouts
 
 
 TOP_N = 10
@@ -60,9 +67,50 @@ def send_telegram(token: str, chat_id: str, html: str) -> None:
     response.raise_for_status()
 
 
-def main() -> int:
-    results = scan_smallcap_breakouts()
+def download_outcome_prices(log: pd.DataFrame) -> tuple:
+    """Daily bars for every live signal's ticker plus IWM, from a week before the oldest live scan."""
+    live = log[log["Status"].isin(LIVE_STATUSES)]
+    if live.empty:
+        return {}, None
+    tickers = sorted(set(live["Ticker"]))
+    start = (pd.Timestamp(live["Scan Date"].min()) - timedelta(days=10)).strftime("%Y-%m-%d")
+    # Unadjusted prices, so later dividend adjustments don't move bars away from the logged levels.
+    batch = yf.download(
+        tickers=tickers + [BENCHMARK], start=start, interval="1d", group_by="ticker",
+        auto_adjust=False, progress=False, threads=True,
+    )
+    frames = {ticker: _ticker_frame(batch, ticker) for ticker in tickers}
+    benchmark = _ticker_frame(batch, BENCHMARK)
+    return frames, benchmark["Close"].dropna() if "Close" in benchmark else None
+
+
+def record_signals(log_path: str, results, regime: dict, scan_date) -> str:
+    """Append today's setups to the log, re-check live signals, save, and return a one-line summary."""
+    log = append_signals(read_log(log_path), results, scan_date, regime.get("label", ""))
+    frames, benchmark_close = download_outcome_prices(log)
+    log = update_outcomes(log, frames, benchmark_close, today=scan_date)
+    log.to_csv(log_path, index=False)
+    summary = summarize_log(log)
+    line = f"Signal log: {summary['signals']} signals since {summary['first_scan']}, {summary['trades']} closed trades"
+    if summary["trades"]:
+        line += f", win rate {summary['win_rate_pct']}%, average {summary['average_r']:+.2f}R"
+    return line
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Run the breakout scan and report the results.")
+    parser.add_argument("--log", help="CSV signal log to append to and update.")
+    args = parser.parse_args(argv)
+    scan_date = datetime.now(ZoneInfo("America/New_York")).date()
+
     regime = get_smallcap_regime()
+    try:
+        results = scan_smallcap_breakouts()
+    except Exception:
+        if args.log:
+            # Still re-check open signals so a failed scan doesn't stall the track record.
+            print(record_signals(args.log, None, regime, scan_date))
+        raise
 
     try:
         earnings_source, earnings_dates = get_upcoming_earnings()
@@ -77,6 +125,13 @@ def main() -> int:
         earnings_note = f"Earnings dates unavailable, nothing left out: {error}"
 
     markdown, html = build_report(results, regime, earnings_note)
+    log_error = None
+    if args.log:
+        try:
+            markdown += "\n\n" + record_signals(args.log, results, regime, scan_date)
+        except Exception as error:
+            log_error = error
+            markdown += f"\n\nSignal log not updated: {error}"
     print(markdown)
 
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")
@@ -90,7 +145,8 @@ def main() -> int:
         print("Sent to Telegram.")
     else:
         print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; results are in the job summary only.")
-    return 0
+    # The alerts went out, but fail the job so a broken signal log gets noticed.
+    return 1 if log_error else 0
 
 
 if __name__ == "__main__":
