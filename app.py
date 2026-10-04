@@ -344,6 +344,10 @@ def sanitize_ai_text(text: str) -> str:
     return text.replace("$", r"\$")
 
 
+DASHBOARD_TAB = "📊 Dashboard"
+SCANNER_TAB = "🚀 Breakout Scanner"
+
+
 def load_scanner_ticker():
     """Switch the dashboard to the breakout candidate clicked in the scanner table."""
     selection = st.session_state.get("breakout_table")
@@ -352,6 +356,7 @@ def load_scanner_ticker():
     if rows and rows[0] < len(tickers):
         st.session_state.ticker_mode = "Custom Input"
         st.session_state.custom_ticker = tickers[rows[0]]
+        st.session_state.main_view = DASHBOARD_TAB
 
 
 st.title("📈 AI Trading Dashboard")
@@ -461,252 +466,256 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-watchlist = normalize_watchlist(watchlist_selection or [selected_ticker])
-with st.spinner("Loading watchlist and market movers..."):
-    watchlist_df = get_watchlist_snapshot(watchlist, timeframe=timeframe)
-    mover_universe = list(dict.fromkeys(MOVER_UNIVERSE + [selected_ticker]))
-    movers_df = get_market_movers(mover_universe)
 
-st.markdown("### Dashboard Views")
-view_columns = st.columns(6, gap="small")
-view_links = [
-    ("Watchlist", "#watchlist-overview"),
-    ("Breakouts", "#breakout-scanner"),
-    ("Technicals", "#technical-chart"),
-    ("Catalysts", "#catalysts"),
-    ("Backtest", "#backtest"),
-    ("AI Analysis", "#ai-analysis"),
-]
-for column, (label, anchor) in zip(view_columns, view_links):
-    with column:
-        st.markdown(f'<a class="view-button" href="{anchor}">{label}</a>', unsafe_allow_html=True)
+dashboard_tab, scanner_tab = st.tabs(
+    [DASHBOARD_TAB, SCANNER_TAB], key="main_view", on_change="rerun"
+)
 
-watchlist_col, movers_col = st.columns(2, gap="large")
-with watchlist_col:
-    st.markdown('<div id="watchlist-overview"></div>', unsafe_allow_html=True)
-    st.subheader("📋 Watchlist Overview")
-    st.caption(f"Selected asset: {selected_ticker} | {len(watchlist)} symbols tracked")
-    watchlist_height = max(74, 39 * (len(watchlist_df) + 1))
-    st.dataframe(
-        watchlist_df.drop(columns=["Focus"], errors="ignore"),
-        hide_index=True,
-        height=watchlist_height,
-        width="stretch",
-        column_config={
-            "Focus": st.column_config.TextColumn("", width="small"),
-            "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
-            "Change": st.column_config.NumberColumn("Today", format="%.2f%%"),
-            "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
-            "TA Score": st.column_config.NumberColumn("TA Score", format="%d"),
-        },
-    )
+# The scanner renders first so a fresh scan feeds the chart overlay in the dashboard tab
+with scanner_tab:
+    scan_title_col, scan_btn_col = st.columns([3, 1])
+    with scan_title_col:
+        st.subheader("🚀 Small-Cap Breakout Scanner")
+        st.caption(
+            f"US stocks with a {MIN_MARKET_CAP / 1e6:,.0f}M-{MAX_MARKET_CAP / 1e9:,.0f}B USD market cap and at least "
+            f"{MIN_DOLLAR_VOLUME / 1e6:,.0f}M USD average daily dollar volume, in a 3-8 week base within 8% of the pivot, "
+            f"above the 50-day average, with a measured-move reward/risk of {MIN_REWARD_RISK:.0f}:1 or better."
+        )
+    with scan_btn_col:
+        if st.button("🔎 Run Breakout Scan", width="stretch"):
+            with st.spinner("Screening small caps and measuring bases (this can take up to a minute)..."):
+                try:
+                    st.session_state.scanner_results = scan_smallcap_breakouts()
+                    st.session_state.scanner_error = None
+                except Exception as error:
+                    st.session_state.scanner_results = None
+                    st.session_state.scanner_error = str(error)
+            st.session_state.scanner_reviews = {}
+            st.session_state.scanner_review_error = None
 
-with movers_col:
-    st.markdown('<div id="market-movers"></div>', unsafe_allow_html=True)
-    st.subheader("⚡ Top Market Movers")
-    scan_timestamp = movers_df.attrs.get("scan_timestamp", "Unavailable")
-    universe_size = movers_df.attrs.get("universe_size", len(mover_universe))
-    st.caption(f"Positive relative movers | {universe_size} stocks scanned | {scan_timestamp}")
-    if movers_df.empty:
-        st.info("No positive relative movers are available for the current market session.")
+    scan_results = st.session_state.scanner_results
+    if scan_results is not None and scan_results.attrs.get("universe_source") == "fallback list":
+        st.warning(
+            "The Yahoo screener is unavailable, so this scan used a built-in list of "
+            f"{scan_results.attrs.get('universe_size', 'N/A')} small caps whose market caps are not re-checked. "
+            f"Screener error: {scan_results.attrs.get('screener_error')}"
+        )
+    if scan_results is None and st.session_state.get("scanner_error"):
+        st.error(f"Breakout scan failed: {st.session_state.scanner_error}")
+    elif scan_results is None:
+        st.info("Run the scan to find small caps setting up for a breakout. Results are cached for 15 minutes.")
+    elif scan_results.empty:
+        st.warning(scan_results.attrs.get("error") or "No small caps currently meet the breakout and reward/risk criteria.")
     else:
-        movers_height = max(74, 39 * (len(movers_df) + 1))
+        st.caption(
+            f"{len(scan_results)} setups | {scan_results.attrs.get('analyzed', 'N/A')} of "
+            f"{scan_results.attrs.get('universe_size', 'N/A')} stocks analyzed | "
+            f"{scan_results.attrs.get('scan_timestamp', '')} | Click a row to load it into the dashboard."
+        )
+        reviews = st.session_state.scanner_reviews
+        display_df = scan_results.copy()
+        display_df.insert(1, "AI Grade", [reviews.get(t, {}).get("grade", "") for t in display_df["Ticker"]])
+        display_df.insert(2, "AI Risk", [reviews.get(t, {}).get("risk_level", "") for t in display_df["Ticker"]])
+        display_df["Market Cap"] = display_df["Market Cap"].apply(
+            lambda value: value / 1e6 if isinstance(value, (int, float)) else None
+        )
+        st.session_state.scanner_display_tickers = list(display_df["Ticker"])
         st.dataframe(
-            movers_df,
+            display_df,
+            key="breakout_table",
+            on_select=load_scanner_ticker,
+            selection_mode="single-row",
             hide_index=True,
-            height=movers_height,
             width="stretch",
+            height=min(39 * (len(display_df) + 1), 460),
             column_config={
                 "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
-                "Change": st.column_config.NumberColumn("Change", format="%.2f%%"),
-                "Relative Gain": st.column_config.NumberColumn("Vs SPY", format="%.2f%%"),
-                "Day Range": st.column_config.NumberColumn("Day Range", format="%.2f%%"),
+                "Market Cap": st.column_config.NumberColumn("Mkt Cap", format="$%.0fM"),
+                "Pivot": st.column_config.NumberColumn("Pivot", format="$%.2f"),
+                "To Pivot": st.column_config.NumberColumn("To Pivot", format="%.2f%%"),
+                "Stop": st.column_config.NumberColumn("Stop", format="$%.2f"),
+                "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
+                "Reward/Risk": st.column_config.NumberColumn("R:R", format="%.1f"),
+                "Base Depth": st.column_config.NumberColumn("Base Depth", format="%.1f%%"),
                 "RVOL": st.column_config.NumberColumn("RVOL", format="%.2fx"),
-                "Mover Score": st.column_config.NumberColumn("Score", format="%.1f"),
+                "RS vs IWM": st.column_config.NumberColumn("RS vs IWM (3M)", format="%.1f%%"),
+                "Breakout Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
             },
         )
 
+        review_count = min(8, len(scan_results))
+        review_col, review_note_col = st.columns([1, 3])
+        with review_col:
+            run_review = st.button(
+                f"🤖 AI Review Top {review_count}",
+                width="stretch",
+                disabled=not is_ai_configured(),
+            )
+        with review_note_col:
+            st.caption(
+                "Grades the top setups for catalysts and small-cap red flags (dilution, reverse splits, "
+                "earnings inside the breakout window) in a single Gemini request."
+                if is_ai_configured() else "AI review needs GEMINI_API_KEY in Streamlit secrets or the environment."
+            )
+        if run_review:
+            candidates = scan_results.head(review_count).to_dict("records")
+            with st.spinner("Collecting float, short interest and headlines for the top candidates..."):
+                contexts = {c["Ticker"]: get_candidate_context(c["Ticker"]) for c in candidates}
+            with st.spinner("Running AI review..."):
+                review_result = review_breakout_candidates(candidates, contexts)
+            st.session_state.scanner_reviews = review_result["reviews"]
+            st.session_state.scanner_review_error = review_result["error"]
+            st.rerun()
 
-st.divider()
-st.markdown('<div id="breakout-scanner"></div>', unsafe_allow_html=True)
-scan_title_col, scan_btn_col = st.columns([3, 1])
-with scan_title_col:
-    st.subheader("🚀 Small-Cap Breakout Scanner")
-    st.caption(
-        f"US stocks with a {MIN_MARKET_CAP / 1e6:,.0f}M-{MAX_MARKET_CAP / 1e9:,.0f}B USD market cap and at least "
-        f"{MIN_DOLLAR_VOLUME / 1e6:,.0f}M USD average daily dollar volume, in a 3-8 week base within 8% of the pivot, "
-        f"above the 50-day average, with a measured-move reward/risk of {MIN_REWARD_RISK:.0f}:1 or better."
-    )
-with scan_btn_col:
-    if st.button("🔎 Run Breakout Scan", width="stretch"):
-        with st.spinner("Screening small caps and measuring bases (this can take up to a minute)..."):
-            try:
-                st.session_state.scanner_results = scan_smallcap_breakouts()
-                st.session_state.scanner_error = None
-            except Exception as error:
-                st.session_state.scanner_results = None
-                st.session_state.scanner_error = str(error)
-        st.session_state.scanner_reviews = {}
-        st.session_state.scanner_review_error = None
+        if st.session_state.scanner_review_error:
+            st.error(f"AI review failed: {st.session_state.scanner_review_error}")
+        for ticker in scan_results["Ticker"]:
+            review = reviews.get(ticker)
+            if not review:
+                continue
+            with st.expander(f"{ticker} | Grade {review['grade']} | Risk {review['risk_level']} | {review['catalyst']}"):
+                st.markdown(sanitize_ai_text(review["thesis"]) or "No thesis provided.")
+                if review["red_flags"]:
+                    st.markdown("**Red flags:**\n" + "\n".join(f"- {sanitize_ai_text(flag)}" for flag in review["red_flags"]))
+                else:
+                    st.caption("No red flags identified from the available data.")
+        st.caption("Screening output is informational, not investment advice. Small-cap breakouts fail often; size positions from the stop.")
 
-scan_results = st.session_state.scanner_results
-if scan_results is not None and scan_results.attrs.get("universe_source") == "fallback list":
-    st.warning(
-        "The Yahoo screener is unavailable, so this scan used a built-in list of "
-        f"{scan_results.attrs.get('universe_size', 'N/A')} small caps whose market caps are not re-checked. "
-        f"Screener error: {scan_results.attrs.get('screener_error')}"
-    )
-if scan_results is None and st.session_state.get("scanner_error"):
-    st.error(f"Breakout scan failed: {st.session_state.scanner_error}")
-elif scan_results is None:
-    st.info("Run the scan to find small caps setting up for a breakout. Results are cached for 15 minutes.")
-elif scan_results.empty:
-    st.warning(scan_results.attrs.get("error") or "No small caps currently meet the breakout and reward/risk criteria.")
-else:
-    st.caption(
-        f"{len(scan_results)} setups | {scan_results.attrs.get('analyzed', 'N/A')} of "
-        f"{scan_results.attrs.get('universe_size', 'N/A')} stocks analyzed | "
-        f"{scan_results.attrs.get('scan_timestamp', '')} | Click a row to load it into the dashboard."
-    )
-    reviews = st.session_state.scanner_reviews
-    display_df = scan_results.copy()
-    display_df.insert(1, "AI Grade", [reviews.get(t, {}).get("grade", "") for t in display_df["Ticker"]])
-    display_df.insert(2, "AI Risk", [reviews.get(t, {}).get("risk_level", "") for t in display_df["Ticker"]])
-    display_df["Market Cap"] = display_df["Market Cap"].apply(
-        lambda value: value / 1e6 if isinstance(value, (int, float)) else None
-    )
-    st.session_state.scanner_display_tickers = list(display_df["Ticker"])
-    st.dataframe(
-        display_df,
-        key="breakout_table",
-        on_select=load_scanner_ticker,
-        selection_mode="single-row",
-        hide_index=True,
-        width="stretch",
-        height=min(39 * (len(display_df) + 1), 460),
-        column_config={
-            "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
-            "Market Cap": st.column_config.NumberColumn("Mkt Cap", format="$%.0fM"),
-            "Pivot": st.column_config.NumberColumn("Pivot", format="$%.2f"),
-            "To Pivot": st.column_config.NumberColumn("To Pivot", format="%.2f%%"),
-            "Stop": st.column_config.NumberColumn("Stop", format="$%.2f"),
-            "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
-            "Reward/Risk": st.column_config.NumberColumn("R:R", format="%.1f"),
-            "Base Depth": st.column_config.NumberColumn("Base Depth", format="%.1f%%"),
-            "RVOL": st.column_config.NumberColumn("RVOL", format="%.2fx"),
-            "RS vs IWM": st.column_config.NumberColumn("RS vs IWM (3M)", format="%.1f%%"),
-            "Breakout Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
-        },
-    )
+with dashboard_tab:
+    watchlist = normalize_watchlist(watchlist_selection or [selected_ticker])
+    with st.spinner("Loading watchlist and market movers..."):
+        watchlist_df = get_watchlist_snapshot(watchlist, timeframe=timeframe)
+        mover_universe = list(dict.fromkeys(MOVER_UNIVERSE + [selected_ticker]))
+        movers_df = get_market_movers(mover_universe)
 
-    review_count = min(8, len(scan_results))
-    review_col, review_note_col = st.columns([1, 3])
-    with review_col:
-        run_review = st.button(
-            f"🤖 AI Review Top {review_count}",
+    st.markdown("### Dashboard Views")
+    view_columns = st.columns(5, gap="small")
+    view_links = [
+        ("Watchlist", "#watchlist-overview"),
+        ("Technicals", "#technical-chart"),
+        ("Catalysts", "#catalysts"),
+        ("Backtest", "#backtest"),
+        ("AI Analysis", "#ai-analysis"),
+    ]
+    for column, (label, anchor) in zip(view_columns, view_links):
+        with column:
+            st.markdown(f'<a class="view-button" href="{anchor}">{label}</a>', unsafe_allow_html=True)
+
+    watchlist_col, movers_col = st.columns(2, gap="large")
+    with watchlist_col:
+        st.markdown('<div id="watchlist-overview"></div>', unsafe_allow_html=True)
+        st.subheader("📋 Watchlist Overview")
+        st.caption(f"Selected asset: {selected_ticker} | {len(watchlist)} symbols tracked")
+        watchlist_height = max(74, 39 * (len(watchlist_df) + 1))
+        st.dataframe(
+            watchlist_df.drop(columns=["Focus"], errors="ignore"),
+            hide_index=True,
+            height=watchlist_height,
             width="stretch",
-            disabled=not is_ai_configured(),
+            column_config={
+                "Focus": st.column_config.TextColumn("", width="small"),
+                "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                "Change": st.column_config.NumberColumn("Today", format="%.2f%%"),
+                "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
+                "TA Score": st.column_config.NumberColumn("TA Score", format="%d"),
+            },
         )
-    with review_note_col:
-        st.caption(
-            "Grades the top setups for catalysts and small-cap red flags (dilution, reverse splits, "
-            "earnings inside the breakout window) in a single Gemini request."
-            if is_ai_configured() else "AI review needs GEMINI_API_KEY in Streamlit secrets or the environment."
-        )
-    if run_review:
-        candidates = scan_results.head(review_count).to_dict("records")
-        with st.spinner("Collecting float, short interest and headlines for the top candidates..."):
-            contexts = {c["Ticker"]: get_candidate_context(c["Ticker"]) for c in candidates}
-        with st.spinner("Running AI review..."):
-            review_result = review_breakout_candidates(candidates, contexts)
-        st.session_state.scanner_reviews = review_result["reviews"]
-        st.session_state.scanner_review_error = review_result["error"]
-        st.rerun()
 
-    if st.session_state.scanner_review_error:
-        st.error(f"AI review failed: {st.session_state.scanner_review_error}")
-    for ticker in scan_results["Ticker"]:
-        review = reviews.get(ticker)
-        if not review:
-            continue
-        with st.expander(f"{ticker} | Grade {review['grade']} | Risk {review['risk_level']} | {review['catalyst']}"):
-            st.markdown(sanitize_ai_text(review["thesis"]) or "No thesis provided.")
-            if review["red_flags"]:
-                st.markdown("**Red flags:**\n" + "\n".join(f"- {sanitize_ai_text(flag)}" for flag in review["red_flags"]))
-            else:
-                st.caption("No red flags identified from the available data.")
-    st.caption("Screening output is informational, not investment advice. Small-cap breakouts fail often; size positions from the stop.")
+    with movers_col:
+        st.markdown('<div id="market-movers"></div>', unsafe_allow_html=True)
+        st.subheader("⚡ Top Market Movers")
+        scan_timestamp = movers_df.attrs.get("scan_timestamp", "Unavailable")
+        universe_size = movers_df.attrs.get("universe_size", len(mover_universe))
+        st.caption(f"Positive relative movers | {universe_size} stocks scanned | {scan_timestamp}")
+        if movers_df.empty:
+            st.info("No positive relative movers are available for the current market session.")
+        else:
+            movers_height = max(74, 39 * (len(movers_df) + 1))
+            st.dataframe(
+                movers_df,
+                hide_index=True,
+                height=movers_height,
+                width="stretch",
+                column_config={
+                    "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                    "Change": st.column_config.NumberColumn("Change", format="%.2f%%"),
+                    "Relative Gain": st.column_config.NumberColumn("Vs SPY", format="%.2f%%"),
+                    "Day Range": st.column_config.NumberColumn("Day Range", format="%.2f%%"),
+                    "RVOL": st.column_config.NumberColumn("RVOL", format="%.2fx"),
+                    "Mover Score": st.column_config.NumberColumn("Score", format="%.1f"),
+                },
+            )
 
-st.divider()
-st.markdown('<div id="selected-asset"></div>', unsafe_allow_html=True)
-st.subheader("Selected Asset")
-stock_profile = get_stock_profile(selected_ticker)
-profile_columns = st.columns([1.2, 2.0, 1.3, 1.5, 1.2])
-profile_items = [
-    ("Ticker", stock_profile["ticker"]),
-    ("Company", stock_profile["name"]),
-    ("Sector", stock_profile["sector"]),
-    ("Industry", stock_profile["industry"]),
-    ("Exchange", stock_profile["exchange"]),
-]
-for column, (label, value) in zip(profile_columns, profile_items):
-    with column:
-        st.markdown(
-            f'<div class="profile-label">{escape(label)}</div>'
-            f'<div class="profile-value">{escape(str(value))}</div>',
-            unsafe_allow_html=True,
-        )
-st.markdown('<div class="profile-description-spacer"></div>', unsafe_allow_html=True)
-with st.expander("Business description", expanded=False):
-    st.write(format_profile_summary(stock_profile))
+    st.divider()
+    st.markdown('<div id="selected-asset"></div>', unsafe_allow_html=True)
+    st.subheader("Selected Asset")
+    stock_profile = get_stock_profile(selected_ticker)
+    profile_columns = st.columns([1.2, 2.0, 1.3, 1.5, 1.2])
+    profile_items = [
+        ("Ticker", stock_profile["ticker"]),
+        ("Company", stock_profile["name"]),
+        ("Sector", stock_profile["sector"]),
+        ("Industry", stock_profile["industry"]),
+        ("Exchange", stock_profile["exchange"]),
+    ]
+    for column, (label, value) in zip(profile_columns, profile_items):
+        with column:
+            st.markdown(
+                f'<div class="profile-label">{escape(label)}</div>'
+                f'<div class="profile-value">{escape(str(value))}</div>',
+                unsafe_allow_html=True,
+            )
+    st.markdown('<div class="profile-description-spacer"></div>', unsafe_allow_html=True)
+    with st.expander("Business description", expanded=False):
+        st.write(format_profile_summary(stock_profile))
 
-# Helper function to assign badge color classes
-def get_badge_class(text_str: str) -> str:
-    lower_s = str(text_str).lower()
-    if "bullish" in lower_s:
-        return "badge-bullish"
-    elif "bearish" in lower_s:
-        return "badge-bearish"
-    return "badge-neutral"
+    # Helper function to assign badge color classes
+    def get_badge_class(text_str: str) -> str:
+        lower_s = str(text_str).lower()
+        if "bullish" in lower_s:
+            return "badge-bullish"
+        elif "bearish" in lower_s:
+            return "badge-bearish"
+        return "badge-neutral"
 
-# --- Live Price Logic & Feed Status ---
-raw_live_price = get_live_price(selected_ticker)
+    # --- Live Price Logic & Feed Status ---
+    raw_live_price = get_live_price(selected_ticker)
 
-if raw_live_price > 0 and not pd.isna(raw_live_price):
-    latest_price = raw_live_price
-    price_badge_text = f"LIVE • {selected_ticker}"
-    price_badge_class = "badge-cyan"
+    if raw_live_price > 0 and not pd.isna(raw_live_price):
+        latest_price = raw_live_price
+        price_badge_text = f"LIVE • {selected_ticker}"
+        price_badge_class = "badge-cyan"
     
-    # Bind live price into df_chart so the Candlestick chart and indicators update
-    df_chart.iloc[-1, df_chart.columns.get_loc('Close')] = latest_price
-    df_chart.iloc[-1, df_chart.columns.get_loc('High')] = max(df_chart['High'].iloc[-1], latest_price)
-    df_chart.iloc[-1, df_chart.columns.get_loc('Low')] = min(df_chart['Low'].iloc[-1], latest_price)
+        # Bind live price into df_chart so the Candlestick chart and indicators update
+        df_chart.iloc[-1, df_chart.columns.get_loc('Close')] = latest_price
+        df_chart.iloc[-1, df_chart.columns.get_loc('High')] = max(df_chart['High'].iloc[-1], latest_price)
+        df_chart.iloc[-1, df_chart.columns.get_loc('Low')] = min(df_chart['Low'].iloc[-1], latest_price)
     
-    # Recalculate indicators so RSI & EMAs on chart match the live price
-    df_chart = add_technical_indicators(df_chart)
-else:
-    latest_price = float(df_chart['Close'].iloc[-1])
-    price_badge_text = f"CLOSED • {selected_ticker}"
-    price_badge_class = "badge-neutral"
+        # Recalculate indicators so RSI & EMAs on chart match the live price
+        df_chart = add_technical_indicators(df_chart)
+    else:
+        latest_price = float(df_chart['Close'].iloc[-1])
+        price_badge_text = f"CLOSED • {selected_ticker}"
+        price_badge_class = "badge-neutral"
 
-st.caption(
-    f"Historical feed: {data_source} | Latest candle: {latest_candle_timestamp} "
-    f"| Price status: {price_badge_text}"
-)
+    st.caption(
+        f"Historical feed: {data_source} | Latest candle: {latest_candle_timestamp} "
+        f"| Price status: {price_badge_text}"
+    )
 
-rsi_val = df_chart['RSI'].iloc[-1] if 'RSI' in df_chart and not df_chart['RSI'].isna().all() else 0.0
+    rsi_val = df_chart['RSI'].iloc[-1] if 'RSI' in df_chart and not df_chart['RSI'].isna().all() else 0.0
 
-rsi_badge = "badge-neutral"
-rsi_state = "Neutral"
-if rsi_val >= 70:
-    rsi_badge = "badge-bearish"
-    rsi_state = "Overbought"
-elif rsi_val <= 30:
-    rsi_badge = "badge-bullish"
-    rsi_state = "Oversold"
+    rsi_badge = "badge-neutral"
+    rsi_state = "Neutral"
+    if rsi_val >= 70:
+        rsi_badge = "badge-bearish"
+        rsi_state = "Overbought"
+    elif rsi_val <= 30:
+        rsi_badge = "badge-bullish"
+        rsi_state = "Oversold"
 
-# Render Custom KPI Cards Top Row
-st.markdown(f"""
+    # Render Custom KPI Cards Top Row
+    st.markdown(f"""
 <div class="metric-container">
     <div class="kpi-card">
         <div class="kpi-title">Price ({timeframe.upper()})</div>
@@ -739,206 +748,206 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-st.divider()
+    st.divider()
 
-st.markdown('<div id="technical-chart"></div>', unsafe_allow_html=True)
-# Interactive Candlestick Chart with Volume
-st.subheader(f"📊 Technical Chart ({timeframe}) — {selected_ticker} [{analysis_mode}]")
+    st.markdown('<div id="technical-chart"></div>', unsafe_allow_html=True)
+    # Interactive Candlestick Chart with Volume
+    st.subheader(f"📊 Technical Chart ({timeframe}) — {selected_ticker} [{analysis_mode}]")
 
-fig = make_subplots(
-    rows=2, cols=1, 
-    shared_xaxes=True, 
-    vertical_spacing=0.03, 
-    row_heights=[0.75, 0.25]
-)
-
-# Row 1: Candlesticks
-fig.add_trace(go.Candlestick(
-    x=df_chart.index, open=df_chart['Open'], high=df_chart['High'],
-    low=df_chart['Low'], close=df_chart['Close'], name="Price",
-    increasing_line_color='#00ff88', decreasing_line_color='#ff0055'
-), row=1, col=1)
-
-# Row 1: EMAs
-if 'EMA_9' in df_chart:
-    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['EMA_9'], line=dict(color='#00F0FF', width=1.5), name="EMA 9"), row=1, col=1)
-if 'EMA_21' in df_chart:
-    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['EMA_21'], line=dict(color='#FF007A', width=1.5), name="EMA 21"), row=1, col=1)
-
-# Row 2: Volume Bar Chart
-colors = ['#00ff88' if row.Close >= row.Open else '#ff0055' for index, row in df_chart.iterrows()]
-fig.add_trace(go.Bar(
-    x=df_chart.index, y=df_chart['Volume'], name="Volume", marker_color=colors, opacity=0.8
-), row=2, col=1)
-
-# Pro-TradingView Styling
-fig.update_layout(
-    template="plotly_dark",
-    height=650,
-    margin=dict(l=10, r=10, t=20, b=20),
-    xaxis_rangeslider_visible=False,
-    plot_bgcolor='rgba(11, 14, 20, 1)',
-    paper_bgcolor='rgba(11, 14, 20, 1)',
-    showlegend=False
-)
-
-# Identify missing dates to remove gaps (ONLY for Intraday timeframes)
-freq_map = {"5m": "5min", "15m": "15min", "1h": "1h"}
-dvalue_map = {"5m": 300000, "15m": 900000, "1h": 3600000}
-
-if timeframe in freq_map:
-    full_idx = pd.date_range(start=df_chart.index.min(), end=df_chart.index.max(), freq=freq_map[timeframe])
-    missing_dt = full_idx.difference(df_chart.index)
-    
-    fig.update_xaxes(
-        rangebreaks=[dict(values=missing_dt, dvalue=dvalue_map[timeframe])]
+    fig = make_subplots(
+        rows=2, cols=1, 
+        shared_xaxes=True, 
+        vertical_spacing=0.03, 
+        row_heights=[0.75, 0.25]
     )
 
-# Subdued gridlines
-fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#1E2532', row=1, col=1)
-fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#1E2532', row=1, col=1)
-fig.update_xaxes(showgrid=False, row=2, col=1)
-fig.update_yaxes(showgrid=False, row=2, col=1)
+    # Row 1: Candlesticks
+    fig.add_trace(go.Candlestick(
+        x=df_chart.index, open=df_chart['Open'], high=df_chart['High'],
+        low=df_chart['Low'], close=df_chart['Close'], name="Price",
+        increasing_line_color='#00ff88', decreasing_line_color='#ff0055'
+    ), row=1, col=1)
 
-# Overlay breakout levels when the selected asset came from the scanner
-if scan_results is not None and not scan_results.empty and selected_ticker in set(scan_results["Ticker"]):
-    breakout_row = scan_results.loc[scan_results["Ticker"] == selected_ticker].iloc[0]
-    for level, label, color in (
-        ("Pivot", "Pivot", "#00F0FF"),
-        ("Stop", "Stop", "#ff0055"),
-        ("Target", "Target", "#00ff88"),
-    ):
-        fig.add_hline(
-            y=breakout_row[level], line_dash="dash", line_color=color, line_width=1,
-            annotation_text=f"{label} {breakout_row[level]:.2f}", annotation_font_color=color,
-            row=1, col=1,
+    # Row 1: EMAs
+    if 'EMA_9' in df_chart:
+        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['EMA_9'], line=dict(color='#00F0FF', width=1.5), name="EMA 9"), row=1, col=1)
+    if 'EMA_21' in df_chart:
+        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['EMA_21'], line=dict(color='#FF007A', width=1.5), name="EMA 21"), row=1, col=1)
+
+    # Row 2: Volume Bar Chart
+    colors = ['#00ff88' if row.Close >= row.Open else '#ff0055' for index, row in df_chart.iterrows()]
+    fig.add_trace(go.Bar(
+        x=df_chart.index, y=df_chart['Volume'], name="Volume", marker_color=colors, opacity=0.8
+    ), row=2, col=1)
+
+    # Pro-TradingView Styling
+    fig.update_layout(
+        template="plotly_dark",
+        height=650,
+        margin=dict(l=10, r=10, t=20, b=20),
+        xaxis_rangeslider_visible=False,
+        plot_bgcolor='rgba(11, 14, 20, 1)',
+        paper_bgcolor='rgba(11, 14, 20, 1)',
+        showlegend=False
+    )
+
+    # Identify missing dates to remove gaps (ONLY for Intraday timeframes)
+    freq_map = {"5m": "5min", "15m": "15min", "1h": "1h"}
+    dvalue_map = {"5m": 300000, "15m": 900000, "1h": 3600000}
+
+    if timeframe in freq_map:
+        full_idx = pd.date_range(start=df_chart.index.min(), end=df_chart.index.max(), freq=freq_map[timeframe])
+        missing_dt = full_idx.difference(df_chart.index)
+    
+        fig.update_xaxes(
+            rangebreaks=[dict(values=missing_dt, dvalue=dvalue_map[timeframe])]
         )
 
-st.plotly_chart(fig, width="stretch")
+    # Subdued gridlines
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#1E2532', row=1, col=1)
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#1E2532', row=1, col=1)
+    fig.update_xaxes(showgrid=False, row=2, col=1)
+    fig.update_yaxes(showgrid=False, row=2, col=1)
 
-# ==============================================================================
-# UPCOMING EVENTS & MACRO CATALYST SECTION
-# ==============================================================================
-st.markdown('<div id="catalysts"></div>', unsafe_allow_html=True)
-st.divider()
-st.subheader("🌐 Catalysts & Macro Economic Environment")
+    # Overlay breakout levels when the selected asset came from the scanner
+    if scan_results is not None and not scan_results.empty and selected_ticker in set(scan_results["Ticker"]):
+        breakout_row = scan_results.loc[scan_results["Ticker"] == selected_ticker].iloc[0]
+        for level, label, color in (
+            ("Pivot", "Pivot", "#00F0FF"),
+            ("Stop", "Stop", "#ff0055"),
+            ("Target", "Target", "#00ff88"),
+        ):
+            fig.add_hline(
+                y=breakout_row[level], line_dash="dash", line_color=color, line_width=1,
+                annotation_text=f"{label} {breakout_row[level]:.2f}", annotation_font_color=color,
+                row=1, col=1,
+            )
 
-col_e1, col_e2, col_e3 = st.columns(3)
-with col_e1:
-    st.metric("Upcoming Earnings Date", event_data.get("earnings_date", "N/A"))
-with col_e2:
-    st.metric("Market Volatility (VIX)", f"{event_data.get('macro_vix', 0.0)}")
-with col_e3:
-    st.metric("10Y Treasury Yield (^TNX)", f"{event_data.get('macro_tnx', 0.0)}%")
+    st.plotly_chart(fig, width="stretch")
 
-days_until_earnings = event_data.get("days_until_earnings")
-proximity_flag = event_data.get("proximity_flag")
-if proximity_flag == "IMMEDIATE_BINARY_RISK":
-    st.error(
-        f"⚠️ Earnings in {days_until_earnings} day(s) ({event_data.get('earnings_date')}). "
-        "Holding through the release is a binary event: consider closing or hedging with defined-risk structures."
-    )
-elif proximity_flag == "SWING_WINDOW_OVERLAP":
-    st.warning(
-        f"⏳ Earnings in {days_until_earnings} days ({event_data.get('earnings_date')}) overlap a typical swing window. "
-        "Plan the exit before the report and expect IV expansion followed by IV crush."
-    )
+    # ==============================================================================
+    # UPCOMING EVENTS & MACRO CATALYST SECTION
+    # ==============================================================================
+    st.markdown('<div id="catalysts"></div>', unsafe_allow_html=True)
+    st.divider()
+    st.subheader("🌐 Catalysts & Macro Economic Environment")
 
-with st.expander("📰 Recent Catalyst Headlines", expanded=False):
-    if event_data.get("news_headlines"):
-        for headline in event_data["news_headlines"]:
-            st.markdown(headline)
-    else:
-        st.caption("No recent headlines are available for this ticker.")
+    col_e1, col_e2, col_e3 = st.columns(3)
+    with col_e1:
+        st.metric("Upcoming Earnings Date", event_data.get("earnings_date", "N/A"))
+    with col_e2:
+        st.metric("Market Volatility (VIX)", f"{event_data.get('macro_vix', 0.0)}")
+    with col_e3:
+        st.metric("10Y Treasury Yield (^TNX)", f"{event_data.get('macro_tnx', 0.0)}%")
 
-st.divider()
-st.markdown('<div id="backtest"></div>', unsafe_allow_html=True)
-st.subheader("📈 Historical TA Signal Check")
-st.caption(
-    "Fixed-horizon backtest of the deterministic TA score. "
-    f"Holding period: {backtest_holding_period} bars | Estimated costs: {backtest_cost_pct:.2f}% | AI decisions excluded."
-)
-backtest = run_ta_backtest(
-    backtest_data,
-    holding_period=backtest_holding_period,
-    cost_per_trade_pct=backtest_cost_pct,
-)
-if backtest["total_trades"] == 0:
-    st.info("No qualifying historical TA signals were found in the loaded timeframe.")
-else:
-    bt_col1, bt_col2, bt_col3, bt_col4 = st.columns(4)
-    bt_col1.metric("Trades", backtest["total_trades"])
-    bt_col2.metric("Win Rate", f"{backtest['win_rate_pct']}%")
-    bt_col3.metric("Cumulative Return", f"{backtest['cumulative_return_pct']}%")
-    bt_col4.metric("Max Drawdown", f"{backtest['max_drawdown_pct']}%")
-
-st.divider()
-
-# Callback to run multi-timeframe LLM synthesis cleanly with Macro Context
-def run_synthesis_callback():
-    with st.spinner("Fetching multi-horizon data, options OI & macro signals..."):
-        df_5m, df_4h, df_1d = get_multi_timeframe_data(selected_ticker)
-        df_1w = get_technical_data(selected_ticker, timeframe="1w")
-        options_data = get_options_sentiment(selected_ticker, analysis_mode=analysis_mode)
-        swing_metrics = get_swing_metrics(selected_ticker, analysis_mode=analysis_mode)
-        intraday_metrics = get_intraday_metrics(selected_ticker)
-
-        st.session_state.llm_analysis = synthesize_signals(
-            ticker=selected_ticker,
-            df_5m=df_5m,
-            df_4h=df_4h,
-            df_1d=df_1d,
-            df_1w=df_1w,
-            sentiment_summary=sentiment_summary,
-            event_data=event_data,
-            options_data=options_data,
-            swing_metrics=swing_metrics,
-            intraday_metrics=intraday_metrics,
-            analysis_mode=analysis_mode,
+    days_until_earnings = event_data.get("days_until_earnings")
+    proximity_flag = event_data.get("proximity_flag")
+    if proximity_flag == "IMMEDIATE_BINARY_RISK":
+        st.error(
+            f"⚠️ Earnings in {days_until_earnings} day(s) ({event_data.get('earnings_date')}). "
+            "Holding through the release is a binary event: consider closing or hedging with defined-risk structures."
+        )
+    elif proximity_flag == "SWING_WINDOW_OVERLAP":
+        st.warning(
+            f"⏳ Earnings in {days_until_earnings} days ({event_data.get('earnings_date')}) overlap a typical swing window. "
+            "Plan the exit before the report and expect IV expansion followed by IV crush."
         )
 
-# Section: AI Synthesis Control
-st.markdown('<div id="ai-analysis"></div>', unsafe_allow_html=True)
-col_title, col_btn = st.columns([3, 1])
-
-with col_title:
-    st.subheader("🤖 Multi-Timeframe AI Synthesis")
-
-    if not is_ai_configured():
-        st.warning("AI analysis is disabled: configure GEMINI_API_KEY in Streamlit secrets or the environment.")
-
-with col_btn:
-    btn_label = "🔄 Regenerate Analysis" if st.session_state.llm_analysis else "🚀 Run AI Analysis"
-    st.button(btn_label, on_click=run_synthesis_callback, width="stretch")
-
-# Render Multi-Factor Deep AI Results
-if st.session_state.llm_analysis:
-    res = st.session_state.llm_analysis
-    
-    if isinstance(res, dict):
-        signal = str(res.get('signal', 'HOLD')).upper()
-        confidence = int(res.get('confidence', 0) * 100) if res.get('confidence', 0) <= 1 else int(res.get('confidence', 0))
-        alignment = res.get('timeframe_confluence', 'N/A')
-        
-        # Color coding for Signal Banner
-        if signal == "BUY":
-            badge_class = "badge-bullish"
-            glow_color = "rgba(0, 255, 136, 0.15)"
-            border_color = "#00ff88"
-            icon = "🟢"
-        elif signal == "SELL":
-            badge_class = "badge-bearish"
-            glow_color = "rgba(255, 0, 85, 0.15)"
-            border_color = "#ff0055"
-            icon = "🔴"
+    with st.expander("📰 Recent Catalyst Headlines", expanded=False):
+        if event_data.get("news_headlines"):
+            for headline in event_data["news_headlines"]:
+                st.markdown(headline)
         else:
-            badge_class = "badge-neutral"
-            glow_color = "rgba(160, 174, 192, 0.15)"
-            border_color = "#A0AEC0"
-            icon = "🟡"
+            st.caption("No recent headlines are available for this ticker.")
 
-        # --- Top Level Signal Summary Banner ---
-        st.markdown(f"""
+    st.divider()
+    st.markdown('<div id="backtest"></div>', unsafe_allow_html=True)
+    st.subheader("📈 Historical TA Signal Check")
+    st.caption(
+        "Fixed-horizon backtest of the deterministic TA score. "
+        f"Holding period: {backtest_holding_period} bars | Estimated costs: {backtest_cost_pct:.2f}% | AI decisions excluded."
+    )
+    backtest = run_ta_backtest(
+        backtest_data,
+        holding_period=backtest_holding_period,
+        cost_per_trade_pct=backtest_cost_pct,
+    )
+    if backtest["total_trades"] == 0:
+        st.info("No qualifying historical TA signals were found in the loaded timeframe.")
+    else:
+        bt_col1, bt_col2, bt_col3, bt_col4 = st.columns(4)
+        bt_col1.metric("Trades", backtest["total_trades"])
+        bt_col2.metric("Win Rate", f"{backtest['win_rate_pct']}%")
+        bt_col3.metric("Cumulative Return", f"{backtest['cumulative_return_pct']}%")
+        bt_col4.metric("Max Drawdown", f"{backtest['max_drawdown_pct']}%")
+
+    st.divider()
+
+    # Callback to run multi-timeframe LLM synthesis cleanly with Macro Context
+    def run_synthesis_callback():
+        with st.spinner("Fetching multi-horizon data, options OI & macro signals..."):
+            df_5m, df_4h, df_1d = get_multi_timeframe_data(selected_ticker)
+            df_1w = get_technical_data(selected_ticker, timeframe="1w")
+            options_data = get_options_sentiment(selected_ticker, analysis_mode=analysis_mode)
+            swing_metrics = get_swing_metrics(selected_ticker, analysis_mode=analysis_mode)
+            intraday_metrics = get_intraday_metrics(selected_ticker)
+
+            st.session_state.llm_analysis = synthesize_signals(
+                ticker=selected_ticker,
+                df_5m=df_5m,
+                df_4h=df_4h,
+                df_1d=df_1d,
+                df_1w=df_1w,
+                sentiment_summary=sentiment_summary,
+                event_data=event_data,
+                options_data=options_data,
+                swing_metrics=swing_metrics,
+                intraday_metrics=intraday_metrics,
+                analysis_mode=analysis_mode,
+            )
+
+    # Section: AI Synthesis Control
+    st.markdown('<div id="ai-analysis"></div>', unsafe_allow_html=True)
+    col_title, col_btn = st.columns([3, 1])
+
+    with col_title:
+        st.subheader("🤖 Multi-Timeframe AI Synthesis")
+
+        if not is_ai_configured():
+            st.warning("AI analysis is disabled: configure GEMINI_API_KEY in Streamlit secrets or the environment.")
+
+    with col_btn:
+        btn_label = "🔄 Regenerate Analysis" if st.session_state.llm_analysis else "🚀 Run AI Analysis"
+        st.button(btn_label, on_click=run_synthesis_callback, width="stretch")
+
+    # Render Multi-Factor Deep AI Results
+    if st.session_state.llm_analysis:
+        res = st.session_state.llm_analysis
+    
+        if isinstance(res, dict):
+            signal = str(res.get('signal', 'HOLD')).upper()
+            confidence = int(res.get('confidence', 0) * 100) if res.get('confidence', 0) <= 1 else int(res.get('confidence', 0))
+            alignment = res.get('timeframe_confluence', 'N/A')
+        
+            # Color coding for Signal Banner
+            if signal == "BUY":
+                badge_class = "badge-bullish"
+                glow_color = "rgba(0, 255, 136, 0.15)"
+                border_color = "#00ff88"
+                icon = "🟢"
+            elif signal == "SELL":
+                badge_class = "badge-bearish"
+                glow_color = "rgba(255, 0, 85, 0.15)"
+                border_color = "#ff0055"
+                icon = "🔴"
+            else:
+                badge_class = "badge-neutral"
+                glow_color = "rgba(160, 174, 192, 0.15)"
+                border_color = "#A0AEC0"
+                icon = "🟡"
+
+            # --- Top Level Signal Summary Banner ---
+            st.markdown(f"""
         <div style="background: {glow_color}; border: 1px solid {border_color}; border-radius: 12px; padding: 18px 24px; margin-bottom: 25px;">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
                 <div style="font-size: 1.4rem; font-weight: 700; color: #FFFFFF;">
@@ -952,77 +961,77 @@ if st.session_state.llm_analysis:
         </div>
         """, unsafe_allow_html=True)
         
-        ## --- Institutional Execution Plan Cards ---
-        plan = res.get('execution_plan', {})
-        st.markdown("### 🎯 Trade Execution Plan")
+            ## --- Institutional Execution Plan Cards ---
+            plan = res.get('execution_plan', {})
+            st.markdown("### 🎯 Trade Execution Plan")
         
-        tp_val = plan.get('take_profit', 0.0)
-        sl_val = plan.get('stop_loss', 0.0)
-        up_limit = plan.get('swing_upper_limit', 'N/A')
-        low_limit = plan.get('swing_lower_limit', 'N/A')
+            tp_val = plan.get('take_profit', 0.0)
+            sl_val = plan.get('stop_loss', 0.0)
+            up_limit = plan.get('swing_upper_limit', 'N/A')
+            low_limit = plan.get('swing_lower_limit', 'N/A')
         
-        # Row 1: Core Trade Targets
-        p_col1, p_col2, p_col3, p_col4 = st.columns(4)
-        with p_col1:
-            st.metric("Target Entry Zone", f"${plan.get('entry_zone', 'N/A')}")
-        with p_col2:
-            st.metric("Take Profit Target", f"${tp_val:.2f}" if isinstance(tp_val, (int, float)) else str(tp_val))
-        with p_col3:
-            st.metric("Stop Loss Level", f"${sl_val:.2f}" if isinstance(sl_val, (int, float)) else str(sl_val))
-        with p_col4:
-            st.metric("Risk / Reward Ratio", str(plan.get('risk_reward_ratio', 'N/A')))
+            # Row 1: Core Trade Targets
+            p_col1, p_col2, p_col3, p_col4 = st.columns(4)
+            with p_col1:
+                st.metric("Target Entry Zone", f"${plan.get('entry_zone', 'N/A')}")
+            with p_col2:
+                st.metric("Take Profit Target", f"${tp_val:.2f}" if isinstance(tp_val, (int, float)) else str(tp_val))
+            with p_col3:
+                st.metric("Stop Loss Level", f"${sl_val:.2f}" if isinstance(sl_val, (int, float)) else str(sl_val))
+            with p_col4:
+                st.metric("Risk / Reward Ratio", str(plan.get('risk_reward_ratio', 'N/A')))
             
-        # Row 2: Expected Move Swing Limits
-        l_col1, l_col2, l_col3, l_col4 = st.columns(4)
-        with l_col1:
-            st.metric("Swing Lower Bound (1SD)", f"${low_limit:.2f}" if isinstance(low_limit, (int, float)) else str(low_limit))
-        with l_col2:
-            st.metric("Swing Upper Bound (1SD)", f"${up_limit:.2f}" if isinstance(up_limit, (int, float)) else str(up_limit))
+            # Row 2: Expected Move Swing Limits
+            l_col1, l_col2, l_col3, l_col4 = st.columns(4)
+            with l_col1:
+                st.metric("Swing Lower Bound (1SD)", f"${low_limit:.2f}" if isinstance(low_limit, (int, float)) else str(low_limit))
+            with l_col2:
+                st.metric("Swing Upper Bound (1SD)", f"${up_limit:.2f}" if isinstance(up_limit, (int, float)) else str(up_limit))
         
-        st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
         
-        # --- Multi-Factor Breakdown Section ---
-        st.markdown("### 🔬 Multi-Factor Analysis Breakdown")
+            # --- Multi-Factor Breakdown Section ---
+            st.markdown("### 🔬 Multi-Factor Analysis Breakdown")
         
-        tab_tech, tab_macro, tab_news, tab_scenarios = st.tabs([
-            "📊 Technical Structure",
-            "🌐 Macro Regime & Risk",
-            "📰 Catalysts & Headlines",
-            "🎲 Catalyst Scenarios"
-        ])
+            tab_tech, tab_macro, tab_news, tab_scenarios = st.tabs([
+                "📊 Technical Structure",
+                "🌐 Macro Regime & Risk",
+                "📰 Catalysts & Headlines",
+                "🎲 Catalyst Scenarios"
+            ])
         
-        with tab_tech:
-            t_col1, t_col2 = st.columns(2)
-            with t_col1:
-                st.markdown("**Higher Timeframe (Macro Trend):**")
-                st.markdown(sanitize_ai_text(res.get('higher_tf_breakdown', 'N/A')))
-            with t_col2:
-                st.markdown("**Intraday Setup (Trigger):**")
-                st.markdown(sanitize_ai_text(res.get('intraday_tf_breakdown', 'N/A')))
+            with tab_tech:
+                t_col1, t_col2 = st.columns(2)
+                with t_col1:
+                    st.markdown("**Higher Timeframe (Macro Trend):**")
+                    st.markdown(sanitize_ai_text(res.get('higher_tf_breakdown', 'N/A')))
+                with t_col2:
+                    st.markdown("**Intraday Setup (Trigger):**")
+                    st.markdown(sanitize_ai_text(res.get('intraday_tf_breakdown', 'N/A')))
             
-            st.markdown("---")
-            s_col1, s_col2 = st.columns(2)
-            supp_val = plan.get('key_support', 0.0)
-            rest_val = plan.get('key_resistance', 0.0)
-            s_col1.metric("Key Technical Support", f"${supp_val:.2f}" if isinstance(supp_val, (int, float)) else str(supp_val))
-            s_col2.metric("Key Technical Resistance", f"${rest_val:.2f}" if isinstance(rest_val, (int, float)) else str(rest_val))
+                st.markdown("---")
+                s_col1, s_col2 = st.columns(2)
+                supp_val = plan.get('key_support', 0.0)
+                rest_val = plan.get('key_resistance', 0.0)
+                s_col1.metric("Key Technical Support", f"${supp_val:.2f}" if isinstance(supp_val, (int, float)) else str(supp_val))
+                s_col2.metric("Key Technical Resistance", f"${rest_val:.2f}" if isinstance(rest_val, (int, float)) else str(rest_val))
 
-        with tab_macro:
-            st.markdown(sanitize_ai_text(res.get('macro_analysis', 'N/A')))
+            with tab_macro:
+                st.markdown(sanitize_ai_text(res.get('macro_analysis', 'N/A')))
 
-        with tab_news:
-            st.markdown(sanitize_ai_text(res.get('news_catalyst_analysis', 'N/A')))
+            with tab_news:
+                st.markdown(sanitize_ai_text(res.get('news_catalyst_analysis', 'N/A')))
 
-        with tab_scenarios:
-            st.markdown(sanitize_ai_text(res.get('catalyst_scenarios', 'N/A')))
+            with tab_scenarios:
+                st.markdown(sanitize_ai_text(res.get('catalyst_scenarios', 'N/A')))
 
-        st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
 
-        # --- Comprehensive Thesis ---
-        with st.expander("📝 View Complete AI Thesis & Strategic Commentary", expanded=True):
-            st.markdown(sanitize_ai_text(res.get('detailed_reasoning', 'N/A')))
+            # --- Comprehensive Thesis ---
+            with st.expander("📝 View Complete AI Thesis & Strategic Commentary", expanded=True):
+                st.markdown(sanitize_ai_text(res.get('detailed_reasoning', 'N/A')))
 
+        else:
+            st.markdown(sanitize_ai_text(str(res)))
     else:
-        st.markdown(sanitize_ai_text(str(res)))
-else:
-    st.info("Click 'Run AI Analysis' above to generate a multi-timeframe unified trade decision.")
+        st.info("Click 'Run AI Analysis' above to generate a multi-timeframe unified trade decision.")
