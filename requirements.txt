@@ -1,9 +1,12 @@
-streamlit>=1.65
-yfinance
-pandas
-numpy
-plotly
-nltk
-google-genai
-alpaca-py
-twelvedata
+# yfinance and Streamlit are pinned exactly because their releases change behaviour the app
+# relies on; bump them deliberately and run the tests. The rest are held below their next major.
+streamlit==1.65.0
+yfinance==1.7.0
+pandas>=2.2,<4
+numpy>=1.26,<3
+plotly>=5.20,<8
+nltk>=3.8,<4
+google-genai>=1.0,<3
+alpaca-py>=0.30,<1
+twelvedata>=1.2,<2
+requests>=2.31,<3

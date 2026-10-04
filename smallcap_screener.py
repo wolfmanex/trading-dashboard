@@ -6,6 +6,7 @@ import streamlit as st
 import yfinance as yf
 from yfinance import EquityQuery
 
+from breakout_backtest import TRADE_COLUMNS, backtest_ticker, summarize_trades
 from breakout_engine import analyze_breakout_setup, rank_breakout_candidates
 from event_engine import parse_news_headlines
 
@@ -282,3 +283,125 @@ def get_candidate_context(ticker: str) -> dict:
     except Exception as error:
         print(f"Candidate context lookup failed for {ticker}: {error}")
     return context
+
+
+def classify_regime(close: pd.Series) -> dict:
+    """Describe the small-cap market trend from IWM's daily closes.
+
+    Uptrend: price above a rising 50-day average that sits above the 200-day.
+    Downtrend: price below a falling 50-day average that sits below the 200-day.
+    Anything else is mixed.
+    """
+    close = pd.to_numeric(close, errors="coerce").dropna() if close is not None else pd.Series(dtype=float)
+    regime = {"label": "Unknown", "price": None, "sma_50": None, "sma_200": None, "sma_50_rising": None}
+    if len(close) < 200:
+        return regime
+
+    sma_50 = close.rolling(50).mean()
+    sma_200 = close.rolling(200).mean()
+    price, latest_50, latest_200 = float(close.iloc[-1]), float(sma_50.iloc[-1]), float(sma_200.iloc[-1])
+    rising = bool(latest_50 > float(sma_50.iloc[-11]))
+    if price > latest_50 > latest_200 and rising:
+        label = "Uptrend"
+    elif price < latest_50 < latest_200 and not rising:
+        label = "Downtrend"
+    else:
+        label = "Mixed"
+    regime.update({
+        "label": label,
+        "price": round(price, 2),
+        "sma_50": round(latest_50, 2),
+        "sma_200": round(latest_200, 2),
+        "sma_50_rising": rising,
+    })
+    return regime
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_smallcap_regime() -> dict:
+    """IWM trend for the scanner header; returns label "Unknown" when the download fails."""
+    try:
+        history = yf.Ticker(BENCHMARK).history(period="2y", interval="1d", auto_adjust=True)
+        return classify_regime(history["Close"] if "Close" in history else None)
+    except Exception as error:
+        print(f"Small-cap regime lookup failed: {error}")
+        return classify_regime(None)
+
+
+def label_trade_regimes(trades: pd.DataFrame, benchmark_close: pd.Series) -> pd.DataFrame:
+    """Tag each trade with whether IWM was above its 50-day average on the signal date."""
+    if trades.empty or benchmark_close is None or benchmark_close.empty:
+        trades["IWM > 50d"] = None
+        return trades
+    above = (benchmark_close > benchmark_close.rolling(50).mean()).reindex(
+        pd.to_datetime(trades["Signal Date"]), method="ffill"
+    )
+    trades["IWM > 50d"] = above.to_numpy()
+    return trades
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def backtest_smallcap_breakouts(
+    max_tickers: int = 150,
+    period: str = "3y",
+    min_reward_risk: float = MIN_REWARD_RISK,
+    min_dollar_volume: float = MIN_DOLLAR_VOLUME,
+) -> dict:
+    """Replay the scanner's rules over the current small-cap universe's daily history.
+
+    The universe is today's list, so stocks that were delisted or fell out of the small-cap range
+    are missing (survivorship bias); results flatter the rules somewhat.
+    """
+    try:
+        universe_source, universe = get_smallcap_universe()
+    except Exception as error:
+        print(f"Small-cap screener unavailable for backtest, using fallback list: {error}")
+        universe_source = "fallback list"
+        universe = {ticker: {"name": ticker, "market_cap": None} for ticker in FALLBACK_SMALLCAPS}
+    tickers = list(universe)[:max_tickers]
+
+    batch = yf.download(
+        tickers=tickers + [BENCHMARK],
+        period=period,
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
+    benchmark_frame = _ticker_frame(batch, BENCHMARK)
+    benchmark_close = benchmark_frame["Close"].dropna() if "Close" in benchmark_frame else None
+
+    rows = []
+    tested = 0
+    for ticker in tickers:
+        frame = _ticker_frame(batch, ticker)
+        if frame.empty:
+            continue
+        tested += 1
+        try:
+            for trade in backtest_ticker(frame, benchmark_close, min_reward_risk, min_dollar_volume):
+                rows.append({"Ticker": ticker, **trade})
+        except Exception as error:
+            print(f"Breakout backtest failed for {ticker}: {error}")
+    if tested == 0:
+        raise RuntimeError(f"No price history downloaded for the {universe_source} universe.")
+
+    trades = label_trade_regimes(pd.DataFrame(rows, columns=TRADE_COLUMNS), benchmark_close)
+    trades = trades.sort_values("Signal Date", ascending=False).reset_index(drop=True)
+
+    by_regime = {}
+    if "IWM > 50d" in trades and trades["IWM > 50d"].notna().any():
+        by_regime = {
+            "IWM above 50-day": summarize_trades(trades[trades["IWM > 50d"] == True]),  # noqa: E712
+            "IWM below 50-day": summarize_trades(trades[trades["IWM > 50d"] == False]),  # noqa: E712
+        }
+    return {
+        "trades": trades,
+        "summary": summarize_trades(trades),
+        "by_regime": by_regime,
+        "tickers_tested": tested,
+        "universe_source": universe_source,
+        "period": period,
+        "run_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }

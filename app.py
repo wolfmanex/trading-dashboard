@@ -4,10 +4,16 @@ from html import escape
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from technical_engine import get_technical_data, get_multi_timeframe_data, get_live_price, add_technical_indicators
+from technical_engine import (
+    get_technical_data, get_multi_timeframe_data, get_live_price, add_technical_indicators,
+    get_market_session, should_apply_live_price,
+)
 from news_engine import get_ticker_news_sentiment
 from index_filter import get_macro_market_trend
-from llm_engine import generate_ai_analysis, synthesize_signals, is_ai_configured, review_breakout_candidates
+from llm_engine import (
+    generate_ai_analysis, synthesize_signals, is_ai_configured, review_breakout_candidates, check_execution_plan,
+    parse_plan_level,
+)
 from event_engine import get_upcoming_events
 from options_engine import get_options_sentiment
 from swing_engine import get_swing_metrics
@@ -17,8 +23,10 @@ from watchlist_engine import get_watchlist_snapshot, normalize_watchlist
 from mover_universe import MOVER_UNIVERSE
 from movers_engine import get_market_movers
 from stock_info import get_stock_profile, format_profile_summary
+from risk_engine import position_size
 from smallcap_screener import (
     get_candidate_context, get_smallcap_universe, scan_smallcap_breakouts,
+    get_smallcap_regime, backtest_smallcap_breakouts,
     MIN_MARKET_CAP, MAX_MARKET_CAP, MIN_REWARD_RISK, MIN_DOLLAR_VOLUME,
 )
 
@@ -405,6 +413,15 @@ with st.sidebar.expander("Backtest", expanded=False):
         "Cost + Slippage (%)", min_value=0.0, max_value=5.0, value=0.0, step=0.05
     )
 
+with st.sidebar.expander("Position Sizing", expanded=False):
+    account_size = st.number_input(
+        "Account Size (USD)", min_value=0.0, value=25_000.0, step=1_000.0, key="account_size"
+    )
+    risk_pct = st.number_input(
+        "Risk per Trade (%)", min_value=0.0, max_value=10.0, value=1.0, step=0.25, key="risk_pct",
+        help="Share counts are sized so a stop-out loses this percentage of the account.",
+    )
+
 with st.sidebar.expander("Data", expanded=False):
     st.caption("Cached market data refreshes automatically. Use this control after a provider outage.")
     refresh_data = st.button("Refresh Market Data", width="stretch")
@@ -418,9 +435,11 @@ if refresh_data:
     get_watchlist_snapshot.clear()
     get_market_movers.clear()
     get_stock_profile.clear()
+    get_live_price.clear()
     get_smallcap_universe.clear()
     scan_smallcap_breakouts.clear()
     get_candidate_context.clear()
+    get_smallcap_regime.clear()
     st.rerun()
 
 # Reset analysis state if user changes the ticker
@@ -493,6 +512,24 @@ with scanner_tab:
             st.session_state.scanner_reviews = {}
             st.session_state.scanner_review_error = None
 
+    regime = get_smallcap_regime()
+    regime_detail = (
+        f"IWM {regime['price']:.2f} | 50-day {regime['sma_50']:.2f} ({'rising' if regime['sma_50_rising'] else 'falling'}) "
+        f"| 200-day {regime['sma_200']:.2f}"
+        if regime["label"] != "Unknown" else "IWM history unavailable"
+    )
+    if regime["label"] == "Uptrend":
+        st.success(f"**Small-cap trend: Uptrend.** Breakouts have the market behind them. {regime_detail}")
+    elif regime["label"] == "Downtrend":
+        st.error(
+            f"**Small-cap trend: Downtrend.** Most breakouts fail in a falling small-cap market; "
+            f"consider smaller size or waiting. {regime_detail}"
+        )
+    elif regime["label"] == "Mixed":
+        st.warning(f"**Small-cap trend: Mixed.** Be selective and keep size modest. {regime_detail}")
+    else:
+        st.caption(f"Small-cap trend unavailable: {regime_detail}.")
+
     scan_results = st.session_state.scanner_results
     if scan_results is not None and scan_results.attrs.get("universe_source") == "fallback list":
         st.warning(
@@ -520,6 +557,12 @@ with scanner_tab:
         display_df["Market Cap"] = display_df["Market Cap"].apply(
             lambda value: value / 1e6 if isinstance(value, (int, float)) else None
         )
+        sizes = [
+            position_size(account_size, risk_pct, row["Pivot"], row["Stop"])
+            for _, row in scan_results.iterrows()
+        ]
+        display_df["Shares"] = [size["shares"] if size else None for size in sizes]
+        display_df["Position"] = [size["position_value"] if size else None for size in sizes]
         st.session_state.scanner_display_tickers = list(display_df["Ticker"])
         st.dataframe(
             display_df,
@@ -541,7 +584,16 @@ with scanner_tab:
                 "RVOL": st.column_config.NumberColumn("RVOL", format="%.2fx"),
                 "RS vs IWM": st.column_config.NumberColumn("RS vs IWM (3M)", format="%.1f%%"),
                 "Breakout Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
+                "Shares": st.column_config.NumberColumn(
+                    "Shares", format="%d",
+                    help=f"Buy-stop at the pivot, sized to risk {risk_pct:.2f}% of a {account_size:,.0f} USD account.",
+                ),
+                "Position": st.column_config.NumberColumn("Position", format="$%.0f"),
             },
+        )
+        st.caption(
+            f"Shares risk {risk_pct:.2f}% of a {account_size:,.0f} USD account from pivot to stop "
+            "(change it under Position Sizing in the sidebar)."
         )
 
         review_count = min(8, len(scan_results))
@@ -581,6 +633,58 @@ with scanner_tab:
                 else:
                     st.caption("No red flags identified from the available data.")
         st.caption("Screening output is informational, not investment advice. Small-cap breakouts fail often; size positions from the stop.")
+
+    st.divider()
+    st.subheader("🧪 Scanner Rules Backtest")
+    st.caption(
+        "Replays the scanner's rules day by day over the last 3 years for the 150 most liquid stocks in the "
+        "current universe: buy-stop at the pivot within 10 days, exit at the stop, the target, or after 40 days. "
+        "Results are in R (multiples of the initial risk). Today's universe leaves out stocks that have since "
+        "been delisted, so the numbers flatter the rules somewhat."
+    )
+    if st.button("🧪 Run Backtest", key="run_scanner_backtest"):
+        with st.spinner("Downloading 3 years of daily data and replaying the rules (this can take a minute or two)..."):
+            try:
+                st.session_state.scanner_backtest = backtest_smallcap_breakouts()
+                st.session_state.scanner_backtest_error = None
+            except Exception as error:
+                st.session_state.scanner_backtest = None
+                st.session_state.scanner_backtest_error = str(error)
+    if st.session_state.get("scanner_backtest_error"):
+        st.error(f"Backtest failed: {st.session_state.scanner_backtest_error}")
+    backtest_result = st.session_state.get("scanner_backtest")
+    if backtest_result:
+        summary = backtest_result["summary"]
+        if summary["trades"] == 0:
+            st.info("No closed trades: the rules did not trigger in the tested history.")
+        else:
+            bt1, bt2, bt3, bt4 = st.columns(4)
+            bt1.metric("Closed Trades", summary["trades"])
+            bt2.metric("Win Rate", f"{summary['win_rate_pct']}%")
+            bt3.metric("Average R", f"{summary['average_r']:+.2f}R")
+            bt4.metric("Total R", f"{summary['total_r']:+.1f}R")
+            st.caption(
+                f"Exits: {summary['target_pct']}% target, {summary['stop_pct']}% stop, "
+                f"{summary['time_exit_pct']}% time exit | {summary['still_open']} trades still open | "
+                f"{backtest_result['tickers_tested']} stocks from {backtest_result['universe_source']} | "
+                f"run {backtest_result['run_timestamp']}"
+            )
+            if backtest_result["by_regime"]:
+                regime_rows = [
+                    {"IWM on signal day": name, "Trades": stats["trades"], "Win Rate": stats["win_rate_pct"],
+                     "Average R": stats["average_r"], "Total R": stats["total_r"]}
+                    for name, stats in backtest_result["by_regime"].items()
+                ]
+                st.dataframe(
+                    pd.DataFrame(regime_rows), hide_index=True, width="stretch",
+                    column_config={
+                        "Win Rate": st.column_config.NumberColumn("Win Rate", format="%.1f%%"),
+                        "Average R": st.column_config.NumberColumn("Average R", format="%+.2f"),
+                        "Total R": st.column_config.NumberColumn("Total R", format="%+.1f"),
+                    },
+                )
+            with st.expander(f"All {len(backtest_result['trades'])} trades", expanded=False):
+                st.dataframe(backtest_result["trades"], hide_index=True, width="stretch")
 
 with dashboard_tab:
     watchlist = normalize_watchlist(watchlist_selection or [selected_ticker])
@@ -681,19 +785,28 @@ with dashboard_tab:
 
     # --- Live Price Logic & Feed Status ---
     raw_live_price = get_live_price(selected_ticker)
+    market_session = get_market_session(selected_ticker)
+    session_labels = {
+        "REGULAR": ("LIVE", "badge-cyan"),
+        "PRE": ("PRE-MARKET", "badge-neutral"),
+        "POST": ("AFTER-HOURS", "badge-neutral"),
+        "CLOSED": ("CLOSED", "badge-neutral"),
+    }
+    has_live_quote = raw_live_price > 0 and not pd.isna(raw_live_price) and market_session != "CLOSED"
 
-    if raw_live_price > 0 and not pd.isna(raw_live_price):
+    if has_live_quote:
         latest_price = raw_live_price
-        price_badge_text = f"LIVE • {selected_ticker}"
-        price_badge_class = "badge-cyan"
-    
-        # Bind live price into df_chart so the Candlestick chart and indicators update
-        df_chart.iloc[-1, df_chart.columns.get_loc('Close')] = latest_price
-        df_chart.iloc[-1, df_chart.columns.get_loc('High')] = max(df_chart['High'].iloc[-1], latest_price)
-        df_chart.iloc[-1, df_chart.columns.get_loc('Low')] = min(df_chart['Low'].iloc[-1], latest_price)
-    
-        # Recalculate indicators so RSI & EMAs on chart match the live price
-        df_chart = add_technical_indicators(df_chart)
+        session_label, price_badge_class = session_labels[market_session]
+        price_badge_text = f"{session_label} • {selected_ticker}"
+
+        # Only a current candle takes the quote, and daily/weekly bars only during the regular session
+        if should_apply_live_price(df_chart.index[-1], timeframe, market_session):
+            df_chart.iloc[-1, df_chart.columns.get_loc('Close')] = latest_price
+            df_chart.iloc[-1, df_chart.columns.get_loc('High')] = max(df_chart['High'].iloc[-1], latest_price)
+            df_chart.iloc[-1, df_chart.columns.get_loc('Low')] = min(df_chart['Low'].iloc[-1], latest_price)
+
+            # Recalculate indicators so RSI & EMAs on chart match the live price
+            df_chart = add_technical_indicators(df_chart)
     else:
         latest_price = float(df_chart['Close'].iloc[-1])
         price_badge_text = f"CLOSED • {selected_ticker}"
@@ -965,6 +1078,14 @@ with dashboard_tab:
             ## --- Institutional Execution Plan Cards ---
             plan = res.get('execution_plan', {})
             st.markdown("### 🎯 Trade Execution Plan")
+            plan_issues = check_execution_plan(res, latest_price)
+            if plan_issues:
+                st.warning(
+                    "**Plan check failed.** Treat these levels with caution:\n"
+                    + "\n".join(f"- {issue}" for issue in plan_issues)
+                )
+            elif signal in ("BUY", "SELL"):
+                st.caption(f"Plan check passed: levels are ordered for a {signal} and sit near the current price.")
         
             tp_val = plan.get('take_profit', 0.0)
             sl_val = plan.get('stop_loss', 0.0)
@@ -981,6 +1102,19 @@ with dashboard_tab:
                 st.metric("Stop Loss Level", f"${sl_val:.2f}" if isinstance(sl_val, (int, float)) else str(sl_val))
             with p_col4:
                 st.metric("Risk / Reward Ratio", str(plan.get('risk_reward_ratio', 'N/A')))
+
+            plan_entry, plan_stop = parse_plan_level(plan.get('entry_zone')), parse_plan_level(plan.get('stop_loss'))
+            plan_size = (
+                position_size(account_size, risk_pct, plan_entry, plan_stop)
+                if signal in ("BUY", "SELL") and not plan_issues and plan_entry and plan_stop else None
+            )
+            if plan_size:
+                st.caption(
+                    f"Position size: **{plan_size['shares']:,} shares** ({plan_size['position_value']:,.0f} USD), "
+                    f"risking {plan_size['dollar_risk']:,.0f} USD ({risk_pct:.2f}% of {account_size:,.0f} USD) "
+                    f"from entry {plan_entry:.2f} to stop {plan_stop:.2f}"
+                    + (". Capped at the account size, so the risk is below budget." if plan_size["capped_by_account"] else ".")
+                )
             
             # Row 2: Expected Move Swing Limits
             l_col1, l_col2, l_col3, l_col4 = st.columns(4)
