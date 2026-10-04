@@ -73,8 +73,17 @@ def sanitize_ai_text(text: str) -> str:
     return text.replace("$", r"\$")
 
 
-DASHBOARD_TAB = "📊 Dashboard"
-SCANNER_TAB = "🚀 Breakout Scanner"
+# Chart colours, kept in step with styles.css and .streamlit/config.toml
+CHART_BG = "#FFFFFF"
+CHART_INK = "#111418"
+CHART_GRID = "#E3E7EC"
+CHART_UP = "#00A85A"
+CHART_DOWN = "#E8173A"
+CHART_BLUE = "#1F3DFF"
+CHART_AMBER = "#F59E0B"
+
+DASHBOARD_TAB = "Dashboard"
+SCANNER_TAB = "Breakout Scanner"
 
 
 def load_scanner_ticker():
@@ -88,7 +97,7 @@ def load_scanner_ticker():
         st.session_state.main_view = DASHBOARD_TAB
 
 
-st.title("📈 AI Trading Dashboard")
+st.title("AI Trading Dashboard")
 
 # ==============================================================================
 # SIDEBAR CONTROLS
@@ -228,14 +237,14 @@ with scanner_tab:
     if scanner_tab.open:
         scan_title_col, scan_btn_col = st.columns([3, 1])
         with scan_title_col:
-            st.subheader("🚀 Small-Cap Breakout Scanner")
+            st.subheader("Small-Cap Breakout Scanner")
             st.caption(
                 f"US stocks with a {MIN_MARKET_CAP / 1e6:,.0f}M-{MAX_MARKET_CAP / 1e9:,.0f}B USD market cap and at least "
                 f"{MIN_DOLLAR_VOLUME / 1e6:,.0f}M USD average daily dollar volume, in a 3-8 week base within 8% of the pivot, "
                 f"above the 50-day average, with a measured-move reward/risk of {MIN_REWARD_RISK:.0f}:1 or better."
             )
         with scan_btn_col:
-            if st.button("🔎 Run Breakout Scan", width="stretch"):
+            if st.button("Run Breakout Scan", width="stretch"):
                 with st.spinner("Screening small caps and measuring bases (this can take up to a minute)..."):
                     try:
                         st.session_state.scanner_results = scan_smallcap_breakouts()
@@ -398,14 +407,14 @@ with scanner_tab:
             st.caption("Screening output is informational, not investment advice. Small-cap breakouts fail often; size positions from the stop.")
 
         st.divider()
-        st.subheader("🧪 Scanner Rules Backtest")
+        st.subheader("Scanner Rules Backtest")
         st.caption(
             "Replays the scanner's rules day by day over the last 3 years for the 150 most liquid stocks in the "
             "current universe: buy-stop at the pivot within 10 days, exit at the stop, the target, or after 40 days. "
             "Results are in R (multiples of the initial risk). Today's universe leaves out stocks that have since "
             "been delisted, so the numbers flatter the rules somewhat."
         )
-        if st.button("🧪 Run Backtest", key="run_scanner_backtest"):
+        if st.button("Run Backtest", key="run_scanner_backtest"):
             with st.spinner("Downloading 3 years of daily data and replaying the rules (this can take a minute or two)..."):
                 try:
                     st.session_state.scanner_backtest = backtest_smallcap_breakouts()
@@ -457,7 +466,7 @@ with dashboard_tab:
             mover_universe = list(dict.fromkeys(MOVER_UNIVERSE + [selected_ticker]))
             movers_df = get_market_movers(mover_universe)
 
-        st.markdown("### Dashboard Views")
+        st.subheader("Dashboard Views")
         view_columns = st.columns(5, gap="small")
         view_links = [
             ("Watchlist", "#watchlist-overview"),
@@ -473,7 +482,7 @@ with dashboard_tab:
         watchlist_col, movers_col = st.columns(2, gap="large")
         with watchlist_col:
             st.markdown('<div id="watchlist-overview"></div>', unsafe_allow_html=True)
-            st.subheader("📋 Watchlist Overview")
+            st.subheader("Watchlist Overview")
             st.caption(f"Selected asset: {selected_ticker} | {len(watchlist)} symbols tracked")
             watchlist_height = max(74, 39 * (len(watchlist_df) + 1))
             st.dataframe(
@@ -492,7 +501,7 @@ with dashboard_tab:
 
         with movers_col:
             st.markdown('<div id="market-movers"></div>', unsafe_allow_html=True)
-            st.subheader("⚡ Top Market Movers")
+            st.subheader("Top Market Movers")
             scan_timestamp = movers_df.attrs.get("scan_timestamp", "Unavailable")
             universe_size = movers_df.attrs.get("universe_size", len(mover_universe))
             st.caption(f"Positive relative movers | {universe_size} stocks scanned | {scan_timestamp}")
@@ -630,7 +639,7 @@ with dashboard_tab:
 
         st.markdown('<div id="technical-chart"></div>', unsafe_allow_html=True)
         # Interactive Candlestick Chart with Volume
-        st.subheader(f"📊 Technical Chart ({timeframe}) — {selected_ticker} [{analysis_mode}]")
+        st.subheader(f"Technical Chart · {selected_ticker} · {timeframe} · {analysis_mode}")
 
         fig = make_subplots(
             rows=2, cols=1, 
@@ -643,29 +652,31 @@ with dashboard_tab:
         fig.add_trace(go.Candlestick(
             x=df_chart.index, open=df_chart['Open'], high=df_chart['High'],
             low=df_chart['Low'], close=df_chart['Close'], name="Price",
-            increasing_line_color='#00ff88', decreasing_line_color='#ff0055'
+            increasing_line_color=CHART_UP, decreasing_line_color=CHART_DOWN,
+            increasing_fillcolor=CHART_UP, decreasing_fillcolor=CHART_DOWN
         ), row=1, col=1)
 
         # Row 1: EMAs
         if 'EMA_9' in df_chart:
-            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['EMA_9'], line=dict(color='#00F0FF', width=1.5), name="EMA 9"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['EMA_9'], line=dict(color=CHART_BLUE, width=1.5), name="EMA 9"), row=1, col=1)
         if 'EMA_21' in df_chart:
-            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['EMA_21'], line=dict(color='#FF007A', width=1.5), name="EMA 21"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['EMA_21'], line=dict(color=CHART_AMBER, width=2), name="EMA 21"), row=1, col=1)
 
         # Row 2: Volume Bar Chart
-        colors = ['#00ff88' if row.Close >= row.Open else '#ff0055' for index, row in df_chart.iterrows()]
+        colors = [CHART_UP if row.Close >= row.Open else CHART_DOWN for index, row in df_chart.iterrows()]
         fig.add_trace(go.Bar(
-            x=df_chart.index, y=df_chart['Volume'], name="Volume", marker_color=colors, opacity=0.8
+            x=df_chart.index, y=df_chart['Volume'], name="Volume", marker_color=colors, opacity=0.55
         ), row=2, col=1)
 
-        # Pro-TradingView Styling
+        # Flat light chart to match the boxed page styling
         fig.update_layout(
-            template="plotly_dark",
+            template="plotly_white",
             height=650,
             margin=dict(l=10, r=10, t=20, b=20),
             xaxis_rangeslider_visible=False,
-            plot_bgcolor='rgba(11, 14, 20, 1)',
-            paper_bgcolor='rgba(11, 14, 20, 1)',
+            plot_bgcolor=CHART_BG,
+            paper_bgcolor=CHART_BG,
+            font=dict(family="JetBrains Mono, monospace", color=CHART_INK, size=11),
             showlegend=False
         )
 
@@ -682,8 +693,10 @@ with dashboard_tab:
             )
 
         # Subdued gridlines
-        fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#1E2532', row=1, col=1)
-        fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#1E2532', row=1, col=1)
+        fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor=CHART_GRID, row=1, col=1)
+        fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor=CHART_GRID, row=1, col=1)
+        fig.update_xaxes(showline=True, linewidth=2, linecolor=CHART_INK, mirror=True)
+        fig.update_yaxes(showline=True, linewidth=2, linecolor=CHART_INK, mirror=True)
         fig.update_xaxes(showgrid=False, row=2, col=1)
         fig.update_yaxes(showgrid=False, row=2, col=1)
 
@@ -691,9 +704,9 @@ with dashboard_tab:
         if scan_results is not None and not scan_results.empty and selected_ticker in set(scan_results["Ticker"]):
             breakout_row = scan_results.loc[scan_results["Ticker"] == selected_ticker].iloc[0]
             for level, label, color in (
-                ("Pivot", "Pivot", "#00F0FF"),
-                ("Stop", "Stop", "#ff0055"),
-                ("Target", "Target", "#00ff88"),
+                ("Pivot", "Pivot", CHART_BLUE),
+                ("Stop", "Stop", CHART_DOWN),
+                ("Target", "Target", CHART_UP),
             ):
                 fig.add_hline(
                     y=breakout_row[level], line_dash="dash", line_color=color, line_width=1,
@@ -708,7 +721,7 @@ with dashboard_tab:
         # ==============================================================================
         st.markdown('<div id="catalysts"></div>', unsafe_allow_html=True)
         st.divider()
-        st.subheader("🌐 Catalysts & Macro Economic Environment")
+        st.subheader("Catalysts & Macro Environment")
 
         col_e1, col_e2, col_e3 = st.columns(3)
         with col_e1:
@@ -731,7 +744,7 @@ with dashboard_tab:
                 "Plan the exit before the report and expect IV expansion followed by IV crush."
             )
 
-        with st.expander("📰 Recent Catalyst Headlines", expanded=False):
+        with st.expander("Recent Catalyst Headlines", expanded=False):
             if event_data.get("news_headlines"):
                 for headline in event_data["news_headlines"]:
                     st.markdown(headline)
@@ -740,7 +753,7 @@ with dashboard_tab:
 
         st.divider()
         st.markdown('<div id="backtest"></div>', unsafe_allow_html=True)
-        st.subheader("📈 Historical TA Signal Check")
+        st.subheader("Historical TA Signal Check")
         st.caption(
             "Fixed-horizon backtest of the deterministic TA score. "
             f"Holding period: {backtest_holding_period} bars | Estimated costs: {backtest_cost_pct:.2f}% | AI decisions excluded."
@@ -803,13 +816,13 @@ with dashboard_tab:
         col_title, col_btn = st.columns([3, 1])
 
         with col_title:
-            st.subheader("🤖 Multi-Timeframe AI Synthesis")
+            st.subheader("Multi-Timeframe AI Synthesis")
 
             if not is_ai_configured():
                 st.warning("AI analysis is disabled: configure GEMINI_API_KEY in Streamlit secrets or the environment.")
 
         with col_btn:
-            btn_label = "🔄 Regenerate Analysis" if st.session_state.llm_analysis else "🚀 Run AI Analysis"
+            btn_label = "Regenerate Analysis" if st.session_state.llm_analysis else "Run AI Analysis"
             st.button(btn_label, on_click=run_synthesis_callback, width="stretch")
 
         # Render Multi-Factor Deep AI Results
@@ -823,39 +836,26 @@ with dashboard_tab:
         
                 # Color coding for Signal Banner
                 if signal == "BUY":
-                    badge_class = "badge-bullish"
-                    glow_color = "rgba(0, 255, 136, 0.15)"
-                    border_color = "#00ff88"
-                    icon = "🟢"
+                    badge_class, banner_class = "badge-bullish", "signal-bullish"
                 elif signal == "SELL":
-                    badge_class = "badge-bearish"
-                    glow_color = "rgba(255, 0, 85, 0.15)"
-                    border_color = "#ff0055"
-                    icon = "🔴"
+                    badge_class, banner_class = "badge-bearish", "signal-bearish"
                 else:
-                    badge_class = "badge-neutral"
-                    glow_color = "rgba(160, 174, 192, 0.15)"
-                    border_color = "#A0AEC0"
-                    icon = "🟡"
+                    badge_class, banner_class = "badge-neutral", "signal-neutral"
 
                 # --- Top Level Signal Summary Banner ---
                 st.markdown(f"""
-        <div style="background: {glow_color}; border: 1px solid {border_color}; border-radius: 12px; padding: 18px 24px; margin-bottom: 25px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
-                <div style="font-size: 1.4rem; font-weight: 700; color: #FFFFFF;">
-                    {icon} Signal: <span style="color: {border_color};">{signal}</span> 
-                    <span style="font-size: 1rem; color: #A0AEC0; font-weight: 400; margin-left: 15px;">Confidence: <strong>{confidence}%</strong></span>
-                </div>
-                <div>
-                    <span class="kpi-badge {badge_class}" style="font-size: 0.85rem; padding: 6px 14px;">Alignment: {alignment}</span>
-                </div>
+        <div class="signal-banner {banner_class}">
+            <div class="signal-title">
+                Signal: {escape(signal)}
+                <span class="signal-confidence">Confidence: <strong>{confidence}%</strong></span>
             </div>
+            <span class="kpi-badge {badge_class}">Alignment: {escape(str(alignment))}</span>
         </div>
         """, unsafe_allow_html=True)
         
                 ## --- Institutional Execution Plan Cards ---
                 plan = res.get('execution_plan', {})
-                st.markdown("### 🎯 Trade Execution Plan")
+                st.subheader("Trade Execution Plan")
                 plan_issues = check_execution_plan(res, latest_price)
                 if plan_issues:
                     st.warning(
@@ -904,7 +904,7 @@ with dashboard_tab:
                 st.markdown("<br>", unsafe_allow_html=True)
         
                 # --- Multi-Factor Breakdown Section ---
-                st.markdown("### 🔬 Multi-Factor Analysis Breakdown")
+                st.subheader("Multi-Factor Analysis Breakdown")
         
                 tab_tech, tab_macro, tab_news, tab_scenarios = st.tabs([
                     "📊 Technical Structure",
@@ -941,7 +941,7 @@ with dashboard_tab:
                 st.markdown("<br>", unsafe_allow_html=True)
 
                 # --- Comprehensive Thesis ---
-                with st.expander("📝 View Complete AI Thesis & Strategic Commentary", expanded=True):
+                with st.expander("Complete AI Thesis & Strategic Commentary", expanded=True):
                     st.markdown(sanitize_ai_text(res.get('detailed_reasoning', 'N/A')))
 
             else:
