@@ -1,0 +1,54 @@
+name: Intraday breakout alerts
+
+on:
+  schedule:
+    # Every 15 minutes, 13:00-20:45 UTC on weekdays. That covers 9:30-16:00 New York in both summer
+    # and winter time; the script itself skips runs outside 9:45-16:00. GitHub can delay scheduled runs.
+    - cron: "*/15 13-20 * * 1-5"
+  workflow_dispatch:
+
+concurrency: intraday-alerts
+
+permissions:
+  contents: write
+
+jobs:
+  alerts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Check out the signal log branch
+        run: |
+          if ! git ls-remote --exit-code --heads origin signal-log; then
+            echo "No signal log yet; the scheduled scan creates it."
+            exit 0
+          fi
+          git fetch origin signal-log:refs/remotes/origin/signal-log
+          git worktree add -B signal-log signal-log-data origin/signal-log
+      - name: Check for breakouts
+        if: hashFiles('signal-log-data/signal_log.csv') != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python intraday_alerts.py --log signal-log-data/signal_log.csv --sent signal-log-data/intraday_alerts.csv
+      - name: Save the sent alerts
+        if: hashFiles('signal-log-data/intraday_alerts.csv') != ''
+        working-directory: signal-log-data
+        run: |
+          git add intraday_alerts.csv
+          git diff --cached --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Intraday alerts $(TZ=America/New_York date '+%F %H:%M')"
+          # The scheduled scan also pushes to this branch; rebase onto it if it got there first.
+          for attempt in 1 2 3; do
+            git push origin signal-log && exit 0
+            git pull --rebase origin signal-log
+          done
+          exit 1

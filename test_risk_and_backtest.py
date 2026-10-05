@@ -5,60 +5,57 @@ import numpy as np
 import pandas as pd
 
 from breakout_backtest import backtest_ticker, simulate_trade, summarize_trades, TRADE_COLUMNS
-from llm_engine import check_execution_plan, parse_plan_level
 from risk_engine import position_size
 from smallcap_screener import classify_regime, label_trade_regimes
 from technical_engine import EASTERN, get_market_session, should_apply_live_price
 from test_breakout import breakout_setup_frame
-
-
-def plan_result(signal="BUY", entry="99 - 101", stop=95.0, target=112.0, rr="1:2.4"):
-    return {
-        "signal": signal,
-        "execution_plan": {"entry_zone": entry, "stop_loss": stop, "take_profit": target, "risk_reward_ratio": rr},
-    }
+from trade_levels import average_true_range, compute_trade_plans, structure_levels
 
 
 def eastern(*args):
     return datetime(*args, tzinfo=EASTERN)
 
 
-class PlanCheckTests(unittest.TestCase):
-    def test_parse_plan_level_reads_numbers_strings_and_zones(self):
-        self.assertEqual(parse_plan_level(101.5), 101.5)
-        self.assertEqual(parse_plan_level("99 - 101"), 100.0)
-        self.assertEqual(parse_plan_level("USD 1,200.50"), 1200.5)
-        self.assertIsNone(parse_plan_level("N/A"))
-        self.assertIsNone(parse_plan_level(0.0))
-        self.assertIsNone(parse_plan_level(True))
+def daily_bars(count=30, close=100.0, spread=2.0):
+    index = pd.bdate_range("2026-08-03", periods=count)
+    closes = np.full(count, close)
+    return pd.DataFrame({"Open": closes, "High": closes + spread / 2, "Low": closes - spread / 2, "Close": closes}, index=index)
 
-    def test_well_formed_buy_plan_passes(self):
-        self.assertEqual(check_execution_plan(plan_result(), current_price=100.0), [])
 
-    def test_buy_with_stop_above_entry_is_flagged(self):
-        issues = check_execution_plan(plan_result(stop=104.0), current_price=100.0)
-        self.assertEqual(len(issues), 1)
-        self.assertIn("stop < entry < target", issues[0])
+class TradeLevelTests(unittest.TestCase):
+    def test_atr_of_steady_bars_is_their_range(self):
+        self.assertAlmostEqual(average_true_range(daily_bars(spread=2.0)), 2.0)
 
-    def test_sell_needs_target_below_entry(self):
-        self.assertEqual(check_execution_plan(plan_result("SELL", stop=105.0, target=90.0, rr="1:2"), 100.0), [])
-        self.assertIn("target < entry < stop", check_execution_plan(plan_result("SELL"), 100.0)[0])
+    def test_atr_needs_enough_history(self):
+        self.assertIsNone(average_true_range(daily_bars(count=10)))
 
-    def test_levels_far_from_price_are_flagged(self):
-        issues = check_execution_plan(plan_result(), current_price=200.0)
-        self.assertTrue(any("away from the current price" in issue for issue in issues))
+    def test_structure_levels_use_recent_extremes(self):
+        df = daily_bars()
+        df.iloc[-5, df.columns.get_loc("High")] = 110.0
+        df.iloc[-25, df.columns.get_loc("Low")] = 80.0  # outside the 20-bar window
+        self.assertEqual(structure_levels(df), {"support": 99.0, "resistance": 110.0})
 
-    def test_mismatched_risk_reward_is_flagged(self):
-        issues = check_execution_plan(plan_result(rr="1:5"), current_price=100.0)
-        self.assertEqual(len(issues), 1)
-        self.assertIn("1:2.4", issues[0])
+    def test_swing_plans_use_atr_stops_and_2r_targets(self):
+        levels = compute_trade_plans(100.0, daily_bars(spread=2.0), "Weekly (Swing/Position)")
+        self.assertEqual(levels["source"], "atr")
+        self.assertEqual(levels["long"], {"entry": 100.0, "stop": 97.0, "target": 106.0, "reward_risk": 2.0})
+        self.assertEqual(levels["short"], {"entry": 100.0, "stop": 103.0, "target": 94.0, "reward_risk": 2.0})
 
-    def test_missing_levels_on_a_trade_signal_are_flagged(self):
-        issues = check_execution_plan(plan_result(entry="N/A"), current_price=100.0)
-        self.assertIn("entry", issues[0])
+    def test_intraday_plans_use_tighter_stops(self):
+        levels = compute_trade_plans(100.0, daily_bars(spread=2.0), "Intra-Day (Scalp/Day Trade)")
+        self.assertEqual(levels["long"]["stop"], 99.0)
 
-    def test_hold_with_placeholder_levels_passes(self):
-        self.assertEqual(check_execution_plan(plan_result("HOLD", entry="N/A", stop=0.0, target=0.0), 100.0), [])
+    def test_scanner_levels_win_and_are_long_only(self):
+        row = {"Pivot": 12.4, "Stop": 11.5, "Target": 15.1}
+        levels = compute_trade_plans(12.0, daily_bars(), "Weekly (Swing/Position)", scanner_row=row)
+        self.assertEqual(levels["source"], "scanner")
+        self.assertEqual(levels["long"], {"entry": 12.4, "stop": 11.5, "target": 15.1, "reward_risk": 3.0})
+        self.assertIsNone(levels["short"])
+
+    def test_no_plans_without_history(self):
+        levels = compute_trade_plans(100.0, pd.DataFrame(), "Weekly (Swing/Position)")
+        self.assertIsNone(levels["source"])
+        self.assertIsNone(levels["long"])
 
 
 class MarketSessionTests(unittest.TestCase):

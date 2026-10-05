@@ -2,8 +2,10 @@
 
 Used by .github/workflows/scheduled-scan.yml. Results always go to stdout and, on GitHub Actions,
 to the job summary. When TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set they are also sent to
-Telegram. With --log PATH the setups are also added to the signal log and every live signal's
-outcome is re-checked (see signal_log.py).
+Telegram. When GEMINI_API_KEY is set the top setups are graded by the AI reviewer before anything is
+sent, and the grade is logged with the signal so the Track Record can compare grades. With --log PATH
+the setups are also added to the signal log and every live signal's outcome is re-checked (see
+signal_log.py).
 """
 import argparse
 import os
@@ -18,14 +20,34 @@ import yfinance as yf
 
 from earnings_engine import EARNINGS_WINDOW_DAYS, add_earnings_columns, get_upcoming_earnings
 from signal_log import LIVE_STATUSES, append_signals, read_log, summarize_log, update_outcomes
-from smallcap_screener import BENCHMARK, _ticker_frame, get_smallcap_regime, scan_smallcap_breakouts
+from llm_engine import GEMINI_MODEL, is_ai_configured, review_breakout_candidates
+from smallcap_screener import (
+    BENCHMARK, _ticker_frame, get_candidate_context, get_smallcap_regime, scan_smallcap_breakouts,
+)
 
 
 TOP_N = 10
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 
-def build_report(results, regime: dict, earnings_note: str, top_n: int = TOP_N) -> tuple:
+def grade_top_setups(results, top_n: int = TOP_N) -> str:
+    """Add the AI reviewer's grade and risk level to the top setups (in place); return a one-line note."""
+    if results is None or results.empty:
+        return ""
+    if not is_ai_configured():
+        return "AI grading skipped: GEMINI_API_KEY is not set."
+    candidates = results.head(top_n).to_dict("records")
+    contexts = {candidate["Ticker"]: get_candidate_context(candidate["Ticker"]) for candidate in candidates}
+    outcome = review_breakout_candidates(candidates, contexts)
+    if outcome["error"]:
+        return f"AI grading failed, setups are logged ungraded: {outcome['error']}"
+    reviews = outcome["reviews"]
+    results["AI Grade"] = [reviews.get(ticker, {}).get("grade", "") for ticker in results["Ticker"]]
+    results["AI Risk"] = [reviews.get(ticker, {}).get("risk_level", "") for ticker in results["Ticker"]]
+    return f"AI graded {len(reviews)} of the top {len(candidates)} setups ({GEMINI_MODEL})."
+
+
+def build_report(results, regime: dict, earnings_note: str, top_n: int = TOP_N, ai_note: str = "") -> tuple:
     """Return (markdown, telegram_html) for the top setups."""
     regime_line = f"Small-cap trend (IWM): {regime.get('label', 'Unknown')}"
     source = results.attrs.get("universe_source", "N/A")
@@ -35,25 +57,29 @@ def build_report(results, regime: dict, earnings_note: str, top_n: int = TOP_N) 
     )
     rows = results.head(top_n)
 
-    markdown = [f"## Breakout scan\n", f"{regime_line}  ", f"{header}  ", f"{earnings_note}\n"]
-    html = [f"<b>Breakout scan</b>", escape(regime_line), escape(header), escape(earnings_note), ""]
+    notes = [earnings_note] + ([ai_note] if ai_note else [])
+    markdown = [f"## Breakout scan\n", f"{regime_line}  ", f"{header}  "] + [f"{note}  " for note in notes] + [""]
+    html = [f"<b>Breakout scan</b>", escape(regime_line), escape(header)] + [escape(note) for note in notes] + [""]
     if rows.empty:
         markdown.append("No setups meet the criteria today.")
         html.append("No setups meet the criteria today.")
         return "\n".join(markdown), "\n".join(html)
 
-    markdown.append("| Ticker | Price | Pivot | Stop | Target | R:R | Score | Earnings |")
-    markdown.append("|---|---|---|---|---|---|---|---|")
+    markdown.append("| Ticker | Price | Pivot | Stop | Target | R:R | Score | AI | Earnings |")
+    markdown.append("|---|---|---|---|---|---|---|---|---|")
     for _, row in rows.iterrows():
         earnings = row.get("Earnings") or ""
+        grade = row.get("AI Grade") or ""
+        ai = f"{grade} ({row.get('AI Risk') or 'N/A'} risk)" if grade else ""
         markdown.append(
             f"| {row['Ticker']} | {row['Price']:.2f} | {row['Pivot']:.2f} | {row['Stop']:.2f} | "
-            f"{row['Target']:.2f} | {row['Reward/Risk']:.1f} | {row['Breakout Score']:.0f} | {earnings} |"
+            f"{row['Target']:.2f} | {row['Reward/Risk']:.1f} | {row['Breakout Score']:.0f} | {ai} | {earnings} |"
         )
         html.append(
             f"<b>{escape(str(row['Ticker']))}</b> {row['Price']:.2f} | pivot {row['Pivot']:.2f} "
             f"stop {row['Stop']:.2f} target {row['Target']:.2f} | R:R {row['Reward/Risk']:.1f} "
-            f"| score {row['Breakout Score']:.0f}" + (f" | ER {escape(earnings)}" if earnings else "")
+            f"| score {row['Breakout Score']:.0f}" + (f" | AI {escape(ai)}" if ai else "")
+            + (f" | ER {escape(earnings)}" if earnings else "")
         )
     return "\n".join(markdown), "\n".join(html)
 
@@ -124,7 +150,8 @@ def main(argv=None) -> int:
     except Exception as error:
         earnings_note = f"Earnings dates unavailable, nothing left out: {error}"
 
-    markdown, html = build_report(results, regime, earnings_note)
+    ai_note = grade_top_setups(results)
+    markdown, html = build_report(results, regime, earnings_note, ai_note=ai_note)
     log_error = None
     if args.log:
         try:

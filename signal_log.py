@@ -22,8 +22,9 @@ LOG_URL = f"https://raw.githubusercontent.com/wolfmanex/trading-dashboard/{LOG_B
 LOG_COLUMNS = [
     "Scan Date", "Ticker", "Rank", "Price", "Pivot", "Stop", "Target", "Reward/Risk", "Breakout Score",
     "IWM Trend", "Universe", "Status", "Entry Date", "Entry", "Exit Date", "Exit", "R", "Return %",
-    "IWM %", "Updated",
+    "IWM %", "AI Grade", "AI Risk", "Updated",
 ]
+UNGRADED = "Ungraded"
 
 WAITING = "Waiting"            # not triggered yet, still inside the entry window
 NOT_TRIGGERED = "Not triggered"
@@ -88,6 +89,8 @@ def append_signals(log: pd.DataFrame, results: pd.DataFrame, scan_date: date, iw
             "Breakout Score": row["Breakout Score"],
             "IWM Trend": iwm_trend,
             "Universe": universe,
+            "AI Grade": row.get("AI Grade") or None,
+            "AI Risk": row.get("AI Risk") or None,
             "Status": WAITING,
         })
     if not rows:
@@ -188,3 +191,32 @@ def summarize_log(log: pd.DataFrame, max_rank: int = None) -> dict:
         "first_scan": log["Scan Date"].min() if not log.empty else None,
         "last_scan": log["Scan Date"].max() if not log.empty else None,
     }
+
+
+def summarize_by_grade(log: pd.DataFrame, max_rank: int = None) -> pd.DataFrame:
+    """Track record split by the AI grade the scheduled scan gave each setup before the open.
+
+    One row per grade (A, B, C, then setups the AI didn't grade), so the grades can be compared with each
+    other and with the scanner's own ranking.
+    """
+    columns = ["AI Grade", "Signals", "Closed Trades", "Win Rate %", "Average R", "Total R"]
+    if log.empty:
+        return pd.DataFrame(columns=columns)
+    if max_rank is not None:
+        log = log[pd.to_numeric(log["Rank"], errors="coerce") <= max_rank]
+    grades = log["AI Grade"].fillna("").astype(str).str.strip().str.upper().replace("", UNGRADED)
+    rows = []
+    for grade in ["A", "B", "C", UNGRADED]:
+        subset = log[grades == grade]
+        if subset.empty:
+            continue
+        summary = summarize_log(subset)
+        rows.append({
+            "AI Grade": grade,
+            "Signals": summary["signals"],
+            "Closed Trades": summary["trades"],
+            "Win Rate %": summary["win_rate_pct"],
+            "Average R": summary["average_r"],
+            "Total R": summary["total_r"],
+        })
+    return pd.DataFrame(rows, columns=columns)
