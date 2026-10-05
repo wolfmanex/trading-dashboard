@@ -7,6 +7,11 @@ MAX_BASE_DEPTH = 0.30
 TIGHT_WINDOW = 10
 MAX_PIVOT_DISTANCE = 0.08
 MAX_EXTENSION_ABOVE_PIVOT = 0.02
+# A stop never sits closer than this share of the pivot, even when the ATR is tiny.
+MIN_STOP_PCT = 0.03
+# Below this daily ATR (as a share of price) the stock is pinned, typically by a pending takeover, and a
+# "base" is just the deal spread: skip it. Real small-cap breakout candidates move 2-6% a day.
+MIN_ATR_PCT = 0.015
 
 SCORE_WEIGHTS = {
     "proximity": 0.20,
@@ -76,11 +81,11 @@ def analyze_breakout_setup(df: pd.DataFrame, benchmark_close: pd.Series = None) 
     pivot = base["high"]
     distance_to_pivot = (pivot - price) / pivot
 
-    # Stop sits under the most recent tight area, but never closer than one ATR to the pivot.
+    # Stop sits under the most recent tight area, but never closer than one ATR or MIN_STOP_PCT to the pivot.
     atr = _average_true_range(df)
     latest_atr = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else 0.0
     recent_low = float(df["Low"].iloc[-TIGHT_WINDOW:].min())
-    stop = min(recent_low, pivot - latest_atr)
+    stop = min(recent_low, pivot - latest_atr, pivot * (1 - MIN_STOP_PCT))
     risk = pivot - stop
     # Measured move: the full base depth projected above the pivot.
     target = pivot + (pivot - base["low"])
@@ -138,6 +143,7 @@ def analyze_breakout_setup(df: pd.DataFrame, benchmark_close: pd.Series = None) 
         "trend_points": trend_points,
         "relative_strength": relative_strength,
         "avg_dollar_volume": dollar_volume,
+        "atr_pct": latest_atr / price,
     }
 
 
@@ -159,6 +165,7 @@ def qualifies(setup: dict, min_reward_risk: float, min_dollar_volume: float) -> 
         setup
         and -MAX_EXTENSION_ABOVE_PIVOT <= setup["distance_to_pivot"] <= MAX_PIVOT_DISTANCE
         and setup["above_sma_50"]
+        and setup.get("atr_pct", MIN_ATR_PCT) >= MIN_ATR_PCT
         and setup["reward_risk"] >= min_reward_risk
         and setup["avg_dollar_volume"] >= min_dollar_volume
     )

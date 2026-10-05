@@ -186,7 +186,8 @@ class GradeTests(unittest.TestCase):
                 mock.patch.object(scheduled_scan, "get_candidate_context", return_value={}), \
                 mock.patch.object(scheduled_scan, "review_breakout_candidates",
                                   return_value={"reviews": reviews, "error": None}) as review:
-            note = scheduled_scan.grade_top_setups(results, top_n=2)
+            note, graded = scheduled_scan.grade_top_setups(results, top_n=2)
+        self.assertEqual(graded, reviews)
         self.assertEqual(len(review.call_args.args[0]), 2)
         self.assertEqual(list(results["AI Grade"]), ["A", "C", ""])
         self.assertIn("AI graded 2 of the top 2", note)
@@ -197,12 +198,12 @@ class GradeTests(unittest.TestCase):
     def test_scan_without_a_key_or_with_an_ai_error_leaves_setups_ungraded(self):
         results = scan_results(["AAA"])
         with mock.patch.object(scheduled_scan, "is_ai_configured", return_value=False):
-            self.assertIn("GEMINI_API_KEY", scheduled_scan.grade_top_setups(results))
+            self.assertIn("GEMINI_API_KEY", scheduled_scan.grade_top_setups(results)[0])
         with mock.patch.object(scheduled_scan, "is_ai_configured", return_value=True), \
                 mock.patch.object(scheduled_scan, "get_candidate_context", return_value={}), \
                 mock.patch.object(scheduled_scan, "review_breakout_candidates",
                                   return_value={"reviews": {}, "error": "quota"}):
-            self.assertIn("quota", scheduled_scan.grade_top_setups(results))
+            self.assertIn("quota", scheduled_scan.grade_top_setups(results)[0])
         self.assertNotIn("AI Grade", results)
 
 

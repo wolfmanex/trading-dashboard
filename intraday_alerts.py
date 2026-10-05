@@ -5,6 +5,9 @@ top setups the pre-market scan logged that are still waiting to trigger (see sig
 alerts once per ticker per day when the price is at or above the pivot and the day's volume so far
 runs at least MIN_RVOL times the 20-day average for this point in the session. Sent alerts are kept
 in a CSV next to the signal log so later runs don't repeat them.
+
+With --journal it also checks the open positions in the trade journal (see journal.py) and alerts once
+per position per day when the price reaches its stop or target.
 """
 import argparse
 import os
@@ -17,6 +20,7 @@ import pandas as pd
 import yfinance as yf
 
 from scheduled_scan import TOP_N, send_telegram
+from journal import ALERT_COLUMNS, open_positions, position_alerts, read_journal_file
 from signal_log import WAITING, read_log
 from smallcap_screener import _ticker_frame
 
@@ -113,30 +117,67 @@ def format_alerts(alerts: list, now: datetime) -> str:
     return "\n".join(lines)
 
 
+def format_position_alerts(alerts: list, now: datetime) -> str:
+    lines = [f"<b>Position alert</b> {now.strftime('%H:%M')} New York"]
+    for alert in alerts:
+        level = alert["Stop"] if alert["Kind"] == "stop" else alert["Target"]
+        r_text = f" ({alert['R']:+.2f}R)" if alert["R"] is not None else ""
+        lines.append(
+            f"<b>{escape(alert['Ticker'])}</b> {alert['Side'].lower()} hit its {alert['Kind']} {float(level):.2f}: "
+            f"now {alert['Price']:.2f}, P&amp;L {alert['P&L']:+,.0f} USD{r_text}"
+        )
+    return "\n".join(lines)
+
+
+def latest_prices(intraday: pd.DataFrame, tickers: list, day) -> dict:
+    prices = {}
+    for ticker in tickers:
+        bars = bars_for_day(_ticker_frame(intraday, ticker), day)
+        closes = bars["Close"].dropna() if not bars.empty else []
+        if len(closes):
+            prices[ticker] = float(closes.iloc[-1])
+    return prices
+
+
+def append_rows(path: str, existing: pd.DataFrame, rows: list, columns: list) -> None:
+    new_rows = pd.DataFrame(rows)[columns]
+    (new_rows if existing.empty else pd.concat([existing, new_rows], ignore_index=True)).to_csv(path, index=False)
+
+
+def check_positions(journal_path: str, sent_path: str, now: datetime, notify) -> None:
+    """Alert on journal positions at their stop or target, once per position and kind per day."""
+    positions = open_positions(read_journal_file(journal_path))
+    if positions.empty:
+        print("No open journal positions.")
+        return
+    try:
+        sent = pd.read_csv(sent_path, dtype={"ID": str, "Ticker": str})
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        sent = pd.DataFrame(columns=ALERT_COLUMNS)
+    today = now.date().isoformat()
+    already = set(zip(sent.loc[sent["Date"] == today, "ID"], sent.loc[sent["Date"] == today, "Kind"]))
+    tickers = sorted(set(positions["Ticker"]))
+    prices = latest_prices(download(tickers, period="1d", interval="5m", prepost=False), tickers, now.date())
+    alerts = [alert for alert in position_alerts(positions, prices) if (alert["ID"], alert["Kind"]) not in already]
+    print(f"Checked {len(positions)} open positions: {len(alerts)} at stop or target.")
+    if alerts and notify(format_position_alerts(alerts, now)):
+        append_rows(sent_path, sent, [{**alert, "Date": today} for alert in alerts], ALERT_COLUMNS)
+
+
 def download(tickers: list, **kwargs) -> pd.DataFrame:
     # Unadjusted prices, matching the levels in the signal log.
     return yf.download(tickers=tickers, group_by="ticker", auto_adjust=False, progress=False, threads=True, **kwargs)
 
 
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Alert on scanner setups breaking their pivot on volume.")
-    parser.add_argument("--log", required=True, help="Signal log CSV written by the scheduled scan.")
-    parser.add_argument("--sent", required=True, help="CSV of alerts already sent; appended to.")
-    parser.add_argument("--force", action="store_true", help="Run outside market hours (for testing).")
-    args = parser.parse_args(argv)
-
-    now = datetime.now(EASTERN)
-    if not args.force and not in_alert_window(now):
-        print(f"Outside the alert window ({now:%a %H:%M} New York); nothing to do.")
-        return 0
-
-    sent = read_sent(args.sent)
+def check_setups(log_path: str, sent_path: str, now: datetime, notify) -> None:
+    """Alert on logged top setups breaking their pivot on volume, once per ticker per day."""
+    sent = read_sent(sent_path)
     already = set(sent.loc[sent["Date"] == now.date().isoformat(), "Ticker"])
-    watch = watched_signals(read_log(args.log))
+    watch = watched_signals(read_log(log_path))
     watch = watch[~watch["Ticker"].isin(already)]
     if watch.empty:
         print("No waiting setups to watch.")
-        return 0
+        return
 
     tickers = sorted(set(watch["Ticker"]))
     intraday = download(tickers, period="1d", interval="5m", prepost=False)
@@ -155,21 +196,42 @@ def main(argv=None) -> int:
         if alert:
             alerts.append(alert)
     print(f"Checked {len(tickers)} setups at {now:%H:%M}: {len(alerts)} breaking out on volume.")
-    if not alerts:
+    if alerts and notify(format_alerts(alerts, now)):
+        append_rows(
+            sent_path, sent,
+            [{**alert, "Date": now.date().isoformat(), "Time": now.strftime("%H:%M")} for alert in alerts],
+            SENT_COLUMNS,
+        )
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Alert on scanner setups breaking their pivot on volume.")
+    parser.add_argument("--log", required=True, help="Signal log CSV written by the scheduled scan (may not exist yet).")
+    parser.add_argument("--sent", required=True, help="CSV of alerts already sent; appended to.")
+    parser.add_argument("--journal", help="Trade journal CSV; open positions get stop/target alerts.")
+    parser.add_argument("--position-sent", help="CSV of position alerts already sent; appended to.")
+    parser.add_argument("--force", action="store_true", help="Run outside market hours (for testing).")
+    args = parser.parse_args(argv)
+
+    now = datetime.now(EASTERN)
+    if not args.force and not in_alert_window(now):
+        print(f"Outside the alert window ({now:%a %H:%M} New York); nothing to do.")
         return 0
 
-    message = format_alerts(alerts, now)
-    print(message)
     token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if not (token and chat_id):
-        print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; alerts are in the log only.")
-        return 0
-    send_telegram(token, chat_id, message)
-    new_rows = pd.DataFrame(
-        [{**alert, "Date": now.date().isoformat(), "Time": now.strftime("%H:%M")} for alert in alerts]
-    )[SENT_COLUMNS]
-    (new_rows if sent.empty else pd.concat([sent, new_rows], ignore_index=True)).to_csv(args.sent, index=False)
-    print("Sent to Telegram.")
+
+    def notify(message: str) -> bool:
+        print(message)
+        if not (token and chat_id):
+            print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; alerts are in the log only.")
+            return False
+        send_telegram(token, chat_id, message)
+        print("Sent to Telegram.")
+        return True
+
+    if args.journal:
+        check_positions(args.journal, args.position_sent or "position_alerts.csv", now, notify)
+    check_setups(args.log, args.sent, now, notify)
     return 0
 
 

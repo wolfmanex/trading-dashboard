@@ -62,6 +62,17 @@ def generate_json(prompt: str):
     return json.loads(clean_text, strict=False)
 
 
+def generate_text(prompt: str) -> str:
+    """Send a prompt and return the plain-text reply; raises on a missing key or an empty reply."""
+    if gemini_client is None:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config={"temperature": 0.3})
+    text = (response.text or "").strip()
+    if not text:
+        raise ValueError("The model returned an empty response")
+    return text
+
+
 TRADE_VERDICTS = {"GO", "WAIT", "SKIP"}
 TRADE_DIRECTIONS = {"LONG", "SHORT", "NONE"}
 TRADE_GRADES = {"A", "B", "C"}
@@ -156,11 +167,13 @@ def review_trade_setup(
     intraday_metrics: dict = None,
     scanner_row: dict = None,
     scanner_context: dict = None,
+    market_note: str = "",
 ) -> dict:
     """Ask the model to judge a trade whose levels were calculated in code (see trade_levels.py).
 
-    Returns {"review": dict | None, "error": str | None}. The model picks a direction among the
-    offered plans and grades the setup; it never sets prices.
+    Returns {"review": dict | None, "error": str | None, "prompt": str}. The model picks a direction among
+    the offered plans and grades the setup; it never sets prices. The prompt is returned so follow-up
+    questions (ask_follow_up) see the same data.
     """
     event_data = event_data or {}
     options_data = options_data or {}
@@ -219,6 +232,7 @@ should be skipped, and to point out what the numbers cannot show.
 - Options-implied weekly expected move: +/- {swing_metrics.get("expected_move_usd", "N/A")} USD
 - Options put/call OI ratio {options_data.get("pcr_oi", "N/A")}, call wall {options_data.get("call_wall", "N/A")}, put wall {options_data.get("put_wall", "N/A")}
 - VIX {event_data.get("macro_vix", "N/A")} | US 10-year yield {event_data.get("macro_tnx", "N/A")}%
+- {market_note or "Market conditions and the macro calendar are unavailable."}
 - Next earnings: {event_data.get("earnings_date", "N/A")} ({event_data.get("days_until_earnings", "N/A")} days away)
 - Today: {pd.Timestamp.today().strftime("%Y-%m-%d")}
 - Headlines:
@@ -236,7 +250,8 @@ should be skipped, and to point out what the numbers cannot show.
 - Earnings within 5 days are binary risk: say so, and fill `scenarios` with a bull case, a bear case and how
   to handle the position. Otherwise leave `scenarios` empty.
 - Options data is often missing or thin for small caps; mention it only when it is present and meaningful.
-- You are not given an economic calendar. Do not state dates for FOMC, CPI or other macro events.
+- Use only the macro dates listed under CONTEXT; never state FOMC, CPI or other release dates from memory. A
+  Risk-off market or a major release within two days counts against a fresh entry.
 - If information is missing, say so instead of guessing. Never use the '$' symbol; write prices as numbers.
 
 Output strictly one JSON object:
@@ -256,10 +271,44 @@ Output strictly one JSON object:
 
     try:
         review = validate_trade_review(generate_json(prompt), levels)
-        return {"review": review, "error": None}
+        return {"review": review, "error": None, "prompt": prompt}
     except Exception as e:
         print(f"Trade Review Engine Error: {e}")
-        return {"review": None, "error": str(e)}
+        return {"review": None, "error": str(e), "prompt": prompt}
+
+
+def ask_follow_up(review_prompt: str, review: dict, history: list, question: str) -> dict:
+    """Answer a question about a finished trade review, with the review's data and the conversation so far.
+
+    `history` is a list of {"question", "answer"}. Returns {"answer": str | None, "error": str | None}.
+    """
+    question = str(question or "").strip()
+    if not question:
+        return {"answer": None, "error": "Ask a question first."}
+    conversation = "\n\n".join(f"Trader: {turn['question']}\nYou: {turn['answer']}" for turn in history[-6:])
+    prompt = f"""
+Earlier you reviewed a trade from the data below and gave the verdict that follows it. The trader now has
+a follow-up question. Answer it directly in at most about 150 words of plain text (no JSON, no headings).
+Use only the data below and your review. The entry, stop and target were calculated in code; you may
+discuss other levels only if they appear in the data (e.g. support, resistance, the recent bars), and say
+which. If the data can't answer the question, say so. Never use the '$' symbol.
+
+=== DATA AND INSTRUCTIONS YOU REVIEWED ===
+{review_prompt}
+
+=== YOUR REVIEW ===
+{json.dumps(review, ensure_ascii=False)}
+
+=== CONVERSATION SO FAR ===
+{conversation or "None yet."}
+
+Trader: {question}
+You:"""
+    try:
+        return {"answer": generate_text(prompt), "error": None}
+    except Exception as e:
+        print(f"Follow-up Engine Error: {e}")
+        return {"answer": None, "error": str(e)}
 
 
 BREAKOUT_GRADES = {"A", "B", "C"}
@@ -314,7 +363,7 @@ def format_breakout_candidate(candidate: dict, context: dict) -> str:
 {headlines_str}"""
 
 
-def review_breakout_candidates(candidates: list, contexts: dict) -> dict:
+def review_breakout_candidates(candidates: list, contexts: dict, market_note: str = "") -> dict:
     """Ask the model to grade pre-computed small-cap breakout setups and surface catalysts and red flags.
 
     Returns {"reviews": {ticker: review}, "error": str | None}.
@@ -342,6 +391,11 @@ For each candidate assess:
 4. Risk level: LOW, MEDIUM, HIGH or EXTREME.
 
 If information is missing, say so instead of guessing. Never use the '$' symbol; write prices as numbers or USD.
+
+### MARKET
+{market_note or "Market conditions unavailable."}
+A Risk-off market or a major release (FOMC, CPI, jobs report) within two days makes any breakout less reliable;
+factor that into the grade and name it as a red flag when it applies.
 
 ### CANDIDATES
 {candidate_blocks}

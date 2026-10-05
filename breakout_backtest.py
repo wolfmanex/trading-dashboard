@@ -2,7 +2,8 @@ import numpy as np
 import pandas as pd
 
 from breakout_engine import (
-    BASE_WINDOWS, MAX_BASE_DEPTH, MAX_EXTENSION_ABOVE_PIVOT, MAX_PIVOT_DISTANCE, TIGHT_WINDOW,
+    BASE_WINDOWS, MAX_BASE_DEPTH, MAX_EXTENSION_ABOVE_PIVOT, MAX_PIVOT_DISTANCE, MIN_ATR_PCT, MIN_STOP_PCT,
+    TIGHT_WINDOW,
     analyze_breakout_setup, qualifies,
 )
 
@@ -36,7 +37,7 @@ def _candidate_days(df: pd.DataFrame, min_reward_risk: float, min_dollar_volume:
     prev_close = close.shift(1)
     true_range = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     atr = true_range.rolling(14).mean().fillna(0.0)
-    stop = np.minimum(low.rolling(TIGHT_WINDOW).min(), pivot - atr)
+    stop = np.minimum(np.minimum(low.rolling(TIGHT_WINDOW).min(), pivot - atr), pivot * (1 - MIN_STOP_PCT))
     risk = pivot - stop
     reward_risk = ((pivot - base_low) / risk).where(risk > 0, 0.0)
     distance = (pivot - close) / pivot
@@ -44,6 +45,7 @@ def _candidate_days(df: pd.DataFrame, min_reward_risk: float, min_dollar_volume:
     mask = (
         distance.between(-MAX_EXTENSION_ABOVE_PIVOT, MAX_PIVOT_DISTANCE)
         & (close > close.rolling(50).mean())
+        & (atr / close >= MIN_ATR_PCT * 0.98)
         & (reward_risk >= min_reward_risk * 0.98)
         & ((close * df["Volume"]).rolling(20).mean() >= min_dollar_volume * 0.98)
     ).to_numpy(copy=True)

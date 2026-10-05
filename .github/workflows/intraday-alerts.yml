@@ -32,17 +32,19 @@ jobs:
           fi
           git fetch origin signal-log:refs/remotes/origin/signal-log
           git worktree add -B signal-log signal-log-data origin/signal-log
-      - name: Check for breakouts
-        if: hashFiles('signal-log-data/signal_log.csv') != ''
+      - name: Check for breakouts and journal stops/targets
+        if: hashFiles('signal-log-data/signal_log.csv', 'signal-log-data/journal.csv') != ''
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python intraday_alerts.py --log signal-log-data/signal_log.csv --sent signal-log-data/intraday_alerts.csv
+        run: >
+          python intraday_alerts.py --log signal-log-data/signal_log.csv --sent signal-log-data/intraday_alerts.csv
+          --journal signal-log-data/journal.csv --position-sent signal-log-data/position_alerts.csv
       - name: Save the sent alerts
-        if: hashFiles('signal-log-data/intraday_alerts.csv') != ''
+        if: hashFiles('signal-log-data/intraday_alerts.csv', 'signal-log-data/position_alerts.csv') != ''
         working-directory: signal-log-data
         run: |
-          git add intraday_alerts.csv
+          for file in intraday_alerts.csv position_alerts.csv; do if [ -f "$file" ]; then git add "$file"; fi; done
           git diff --cached --quiet && exit 0
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
