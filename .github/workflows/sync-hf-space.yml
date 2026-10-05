@@ -1,0 +1,26 @@
+name: Sync to Hugging Face Space
+
+# Pushes main to the Hugging Face Space so the hosted app redeploys on every merge.
+# Needs the HF_TOKEN secret (a Hugging Face write token) and the HF_SPACE variable (e.g. "user/space-name").
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency: sync-hf-space
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: ${{ vars.HF_SPACE != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Push to the Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE: ${{ vars.HF_SPACE }}
+        run: |
+          user="${HF_SPACE%%/*}"
+          git push --force "https://${user}:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}" HEAD:main
