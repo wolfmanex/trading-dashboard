@@ -25,8 +25,14 @@ MACRO_WINDOW_DAYS = 14
 EVENT_WARNING_DAYS = 2   # a major release this close makes a fresh breakout entry a coin flip on the number
 RISK_OFF_SIZE = 0.5      # share of the normal position size suggested in a Risk-off market
 
-# Second (decision) day of each FOMC meeting, from the Fed's published 2026 calendar. Extend yearly.
-FOMC_DECISIONS = ["2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09"]
+MAX_CONSECUTIVE_FAILURES = 3   # stop walking the calendar once Nasdaq is clearly unreachable
+
+# Second (decision) day of each FOMC meeting, from the Fed's published calendars (2027 per its
+# 2025-09-05 release; tentative until confirmed). Extend yearly.
+FOMC_DECISIONS = [
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+    "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09", "2027-07-28", "2027-09-15", "2027-10-27", "2027-12-08",
+]
 
 # US releases that move the whole market; matched case-insensitively against Nasdaq's event names.
 MAJOR_EVENTS = [
@@ -123,10 +129,20 @@ def merge_events(events: list, today: date, days: int = MACRO_WINDOW_DAYS) -> li
     return sorted(unique.values(), key=lambda event: (event["date"], event["event"]))
 
 
+def warn_if_fomc_list_stale(today: date = None) -> bool:
+    """Print a warning (and return True) once today is past the last listed FOMC date."""
+    today = today or date.today()
+    if today.isoformat() > max(FOMC_DECISIONS):
+        print(f"Warning: FOMC_DECISIONS ends {max(FOMC_DECISIONS)}; add the Fed's next calendar to market_conditions.py.")
+        return True
+    return False
+
+
 def upcoming_macro_events(today: date = None, days: int = MACRO_WINDOW_DAYS) -> tuple:
     """(events, source note). Nasdaq per weekday, merged with the FOMC list; never raises."""
     today = today or date.today()
-    events, failures, checked = [], 0, 0
+    warn_if_fomc_list_stale(today)
+    events, failures, checked, consecutive = [], 0, 0, 0
     day = today
     while day <= today + timedelta(days=days):
         if day.weekday() < 5:
@@ -135,14 +151,21 @@ def upcoming_macro_events(today: date = None, days: int = MACRO_WINDOW_DAYS) -> 
                 response = requests.get(NASDAQ_ECONOMIC_URL, params={"date": day.isoformat()}, headers=NASDAQ_HEADERS, timeout=10)
                 response.raise_for_status()
                 events += parse_economic_events(response.json(), day.isoformat())
+                consecutive = 0
             except Exception as error:
                 failures += 1
+                consecutive += 1
                 if failures == 1:
                     print(f"Nasdaq economic calendar failed for {day}: {error}")
-                if failures >= 3 and not events:
+                if consecutive >= MAX_CONSECUTIVE_FAILURES:
                     break   # unreachable; don't spend the whole window timing out
         day += timedelta(days=1)
-    source = "Nasdaq economic calendar + Fed FOMC dates" if failures < checked else "Fed FOMC dates only (Nasdaq calendar unavailable)"
+    if not failures:
+        source = "Nasdaq economic calendar + Fed FOMC dates"
+    elif failures < checked:
+        source = f"Nasdaq economic calendar (partial: {failures} of {checked} days failed) + Fed FOMC dates"
+    else:
+        source = "Fed FOMC dates only (Nasdaq calendar unavailable)"
     return merge_events(events, today, days), source
 
 
@@ -159,33 +182,68 @@ def format_events(events: list) -> str:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def get_market_conditions() -> dict:
-    """Everything the market panel shows; parts that fail come back as None/Unknown, never an exception."""
-    conditions = {"iwm": classify_regime(None), "spy": classify_regime(None), "breadth": None, "vix": None,
-                  "vix_change_5d": None, "events": [], "events_source": "", "error": None}
-    try:
-        batch = yf.download(
-            tickers=["IWM", "SPY", "^VIX"], period="2y", interval="1d", group_by="ticker",
-            auto_adjust=True, progress=False, threads=True,
-        )
-        conditions["iwm"] = classify_regime(_ticker_frame(batch, "IWM").get("Close"))
-        conditions["spy"] = classify_regime(_ticker_frame(batch, "SPY").get("Close"))
-        vix_frame = _ticker_frame(batch, "^VIX")
-        vix_close = pd.to_numeric(vix_frame["Close"], errors="coerce").dropna() if "Close" in vix_frame else pd.Series(dtype=float)
-        if len(vix_close) > 5:
-            conditions["vix"] = round(float(vix_close.iloc[-1]), 2)
-            conditions["vix_change_5d"] = round(float(vix_close.iloc[-1] - vix_close.iloc[-6]), 2)
-        stocks = yf.download(
-            tickers=MOVER_UNIVERSE, period="6mo", interval="1d", group_by="ticker",
-            auto_adjust=True, progress=False, threads=True,
-        )
-        conditions["breadth"] = breadth_pct({ticker: _ticker_frame(stocks, ticker) for ticker in MOVER_UNIVERSE})
-    except Exception as error:
-        conditions["error"] = str(error)
-        print(f"Market conditions download failed: {error}")
-    conditions["events"], conditions["events_source"] = upcoming_macro_events()
+def _cached_macro_events() -> tuple:
+    # Cached on its own so a price-download outage doesn't re-walk the Nasdaq calendar on every rerun.
+    return upcoming_macro_events()
+
+
+def _empty_conditions() -> dict:
+    return {"iwm": classify_regime(None), "spy": classify_regime(None), "breadth": None, "vix": None,
+            "vix_change_5d": None, "events": [], "events_source": "", "error": None}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _fetch_market_conditions() -> dict:
+    """Cached market panel data; raises when the index download failed so a bad result isn't cached."""
+    conditions = _empty_conditions()
+    batch = yf.download(
+        tickers=["IWM", "SPY", "^VIX"], period="2y", interval="1d", group_by="ticker",
+        auto_adjust=True, progress=False, threads=True,
+    )
+    if batch is None or batch.empty:
+        raise RuntimeError("index download returned no data")
+    conditions["iwm"] = classify_regime(_ticker_frame(batch, "IWM").get("Close"))
+    conditions["spy"] = classify_regime(_ticker_frame(batch, "SPY").get("Close"))
+    if conditions["iwm"]["label"] == "Unknown" and conditions["spy"]["label"] == "Unknown":
+        raise RuntimeError("IWM and SPY trends unavailable")
+    vix_frame = _ticker_frame(batch, "^VIX")
+    vix_close = pd.to_numeric(vix_frame["Close"], errors="coerce").dropna() if "Close" in vix_frame else pd.Series(dtype=float)
+    if len(vix_close) > 5:
+        conditions["vix"] = round(float(vix_close.iloc[-1]), 2)
+        conditions["vix_change_5d"] = round(float(vix_close.iloc[-1] - vix_close.iloc[-6]), 2)
+    stocks = yf.download(
+        tickers=MOVER_UNIVERSE, period="6mo", interval="1d", group_by="ticker",
+        auto_adjust=True, progress=False, threads=True,
+    )
+    conditions["breadth"] = breadth_pct({ticker: _ticker_frame(stocks, ticker) for ticker in MOVER_UNIVERSE})
+    conditions["events"], conditions["events_source"] = _cached_macro_events()
     conditions.update(classify_market(conditions["iwm"], conditions["spy"], conditions["breadth"], conditions["vix"]))
     return conditions
+
+
+def get_market_conditions() -> dict:
+    """Everything the market panel shows; parts that fail come back as None/Unknown, never an exception.
+
+    A failed download is returned as the Unknown/Neutral fallback without being cached, so the next
+    rerun tries again instead of showing "Neutral" for 30 minutes.
+    """
+    try:
+        return _fetch_market_conditions()
+    except Exception as error:
+        print(f"Market conditions download failed: {error}")
+        conditions = _empty_conditions()
+        conditions["error"] = str(error)
+    conditions["events"], conditions["events_source"] = _cached_macro_events()
+    conditions.update(classify_market(conditions["iwm"], conditions["spy"], conditions["breadth"], conditions["vix"]))
+    return conditions
+
+
+def _clear_market_conditions() -> None:
+    _fetch_market_conditions.clear()
+    _cached_macro_events.clear()
+
+
+get_market_conditions.clear = _clear_market_conditions   # app.py's "Refresh Market Data" calls this
 
 
 def summary_line(conditions: dict) -> str:

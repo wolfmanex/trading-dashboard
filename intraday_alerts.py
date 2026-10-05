@@ -21,6 +21,7 @@ import yfinance as yf
 
 from scheduled_scan import TOP_N, send_telegram
 from journal import ALERT_COLUMNS, open_positions, position_alerts, read_journal_file
+from market_calendar import is_trading_day
 from signal_log import WAITING, read_log
 from smallcap_screener import _ticker_frame
 
@@ -37,7 +38,7 @@ SENT_COLUMNS = ["Date", "Time", "Ticker", "Price", "Pivot", "Stop", "Target", "R
 
 
 def in_alert_window(now: datetime) -> bool:
-    return now.weekday() < 5 and FIRST_CHECK <= now.time() < SESSION_CLOSE
+    return is_trading_day(now.date()) and FIRST_CHECK <= now.time() < SESSION_CLOSE
 
 
 def session_fraction(now: datetime) -> float:
@@ -123,7 +124,7 @@ def format_position_alerts(alerts: list, now: datetime) -> str:
         level = alert["Stop"] if alert["Kind"] == "stop" else alert["Target"]
         r_text = f" ({alert['R']:+.2f}R)" if alert["R"] is not None else ""
         lines.append(
-            f"<b>{escape(alert['Ticker'])}</b> {alert['Side'].lower()} hit its {alert['Kind']} {float(level):.2f}: "
+            f"<b>{escape(str(alert['Ticker']))}</b> {str(alert['Side']).lower()} hit its {alert['Kind']} {float(level):.2f}: "
             f"now {alert['Price']:.2f}, P&amp;L {alert['P&L']:+,.0f} USD{r_text}"
         )
     return "\n".join(lines)
@@ -147,6 +148,12 @@ def append_rows(path: str, existing: pd.DataFrame, rows: list, columns: list) ->
 def check_positions(journal_path: str, sent_path: str, now: datetime, notify) -> None:
     """Alert on journal positions at their stop or target, once per position and kind per day."""
     positions = open_positions(read_journal_file(journal_path))
+    if not positions.empty:
+        # A row saved without a ticker would break the download and the message; skip it.
+        tickers = positions["Ticker"].fillna("").astype(str).str.strip()
+        if (tickers == "").any():
+            print(f"Skipping {int((tickers == '').sum())} open journal positions without a ticker.")
+        positions = positions[tickers != ""].assign(Ticker=tickers[tickers != ""])
     if positions.empty:
         print("No open journal positions.")
         return
@@ -215,7 +222,8 @@ def main(argv=None) -> int:
 
     now = datetime.now(EASTERN)
     if not args.force and not in_alert_window(now):
-        print(f"Outside the alert window ({now:%a %H:%M} New York); nothing to do.")
+        closed = "" if is_trading_day(now.date()) else ", market closed"
+        print(f"Outside the alert window ({now:%a %H:%M} New York{closed}); nothing to do.")
         return 0
 
     token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
@@ -229,9 +237,17 @@ def main(argv=None) -> int:
         print("Sent to Telegram.")
         return True
 
+    # Each check runs on its own, so a failure in one (Telegram rate limit, download error, bad journal
+    # row) doesn't skip the other. Exit 0 either way so the session loop keeps going.
     if args.journal:
-        check_positions(args.journal, args.position_sent or "position_alerts.csv", now, notify)
-    check_setups(args.log, args.sent, now, notify)
+        try:
+            check_positions(args.journal, args.position_sent or "position_alerts.csv", now, notify)
+        except Exception as error:
+            print(f"Position check FAILED: {type(error).__name__}: {error}")
+    try:
+        check_setups(args.log, args.sent, now, notify)
+    except Exception as error:
+        print(f"Setup check FAILED: {type(error).__name__}: {error}")
     return 0
 
 

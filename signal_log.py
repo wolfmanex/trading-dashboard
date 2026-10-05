@@ -40,7 +40,7 @@ def empty_log() -> pd.DataFrame:
 def read_log(source) -> pd.DataFrame:
     """Read a log from a path or file-like object; a missing or empty file gives an empty log."""
     try:
-        log = pd.read_csv(source, dtype={"Ticker": str})
+        log = pd.read_csv(source, dtype={"Ticker": str}, keep_default_na=False, na_values=[""])  # keeps tickers like "NA"
     except (FileNotFoundError, pd.errors.EmptyDataError):
         return empty_log()
     for column in LOG_COLUMNS:

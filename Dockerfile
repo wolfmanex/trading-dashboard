@@ -14,5 +14,6 @@ RUN pip install --no-cache-dir --user -r requirements.txt \
 COPY --chown=user . .
 
 EXPOSE 7860
-CMD ["streamlit", "run", "app.py", "--server.port=7860", "--server.address=0.0.0.0", "--server.headless=true", \
-     "--server.enableXsrfProtection=false", "--browser.gatherUsageStats=false"]
+# XSRF protection is only switched off on Hugging Face Spaces (which sets SPACE_ID), where the app runs in an iframe
+CMD ["sh", "-c", "exec streamlit run app.py --server.port=7860 --server.address=0.0.0.0 --server.headless=true \
+     ${SPACE_ID:+--server.enableXsrfProtection=false} --browser.gatherUsageStats=false"]

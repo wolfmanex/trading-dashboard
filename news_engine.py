@@ -25,7 +25,12 @@ def get_ticker_news_sentiment(ticker: str):
     if not news_items:
         return "Neutral (No News)", "No recent news articles found for this ticker."
 
-    sia = SentimentIntensityAnalyzer()
+    try:
+        sia = SentimentIntensityAnalyzer()
+    except LookupError as e:
+        # The VADER lexicon is missing (the download at import failed, e.g. offline).
+        print(f"VADER lexicon unavailable: {e}")
+        return "Neutral (Error)", f"Sentiment analysis unavailable for {ticker}: VADER lexicon not installed."
     compound_scores = []
     summaries = []
 

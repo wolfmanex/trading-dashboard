@@ -28,7 +28,8 @@ while :; do
     now=$(TZ=America/New_York date +%H:%M)
     [[ "$now" < "$end" ]] || break
     # Pick up journal changes made in the app since the last check.
-    git -C signal-log-data pull -q --rebase origin signal-log || true
+    # --autostash: the afternoon job may start with merged, uncommitted alert files (see market-session.yml).
+    git -C signal-log-data pull -q --rebase --autostash origin signal-log || true
     python intraday_alerts.py --log signal-log-data/signal_log.csv --sent signal-log-data/intraday_alerts.csv \
         --journal signal-log-data/journal.csv --position-sent signal-log-data/position_alerts.csv \
         || echo "Intraday check failed; trying again next round."

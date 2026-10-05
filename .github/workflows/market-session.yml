@@ -3,7 +3,9 @@ name: Market session
 # Started by the morning scan once it finishes. Checks the logged setups and the journal's open
 # positions every 15 minutes through the session (intraday_alerts.py), then sends the evening recap.
 # GitHub's cron never fired in this repo, so this runs as one long dispatched session instead of a
-# schedule. A job may run 6 hours at most, so the session is split at 12:30 New York.
+# schedule. A job may run 6 hours at most, so the session is split at 12:30 New York. If the morning job
+# fails early, the midday job holds the afternoon back until 12:30 so it still reaches 16:00 within its
+# time limit (a job's timeout includes any waiting it does itself).
 on:
   workflow_dispatch:
 
@@ -38,9 +40,31 @@ jobs:
           git -C signal-log-data config user.email "41898282+github-actions[bot]@users.noreply.github.com"
       - id: loop
         run: ./session_loop.sh 12:30
+      - name: Keep the sent alerts for the afternoon
+        # In case the last push to signal-log failed, so the afternoon doesn't repeat the morning's alerts.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: morning-alerts
+          path: |
+            signal-log-data/intraday_alerts.csv
+            signal-log-data/position_alerts.csv
+          if-no-files-found: ignore
+          retention-days: 1
+
+  midday:
+    # Finishes at once on a normal day; after an early morning failure it waits for 12:30 New York.
+    needs: morning
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Wait for 12:30 New York
+        run: |
+          while [[ "$(TZ=America/New_York date +%H:%M)" < "12:30" ]]; do sleep 60; done
 
   afternoon:
-    needs: morning
+    needs: [morning, midday]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
@@ -59,6 +83,28 @@ jobs:
           git worktree add -B signal-log signal-log-data origin/signal-log
           git -C signal-log-data config user.name "github-actions[bot]"
           git -C signal-log-data config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Get the morning's sent alerts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: morning-alerts
+          path: morning-alerts
+      - name: Merge the morning's sent alerts
+        continue-on-error: true
+        # Union of the rows on signal-log and the morning job's copy; the loop commits any additions.
+        run: |
+          python - <<'EOF'
+          import os
+          import pandas as pd
+          for name in ["intraday_alerts.csv", "position_alerts.csv"]:
+              saved, kept = os.path.join("morning-alerts", name), os.path.join("signal-log-data", name)
+              if not os.path.exists(saved):
+                  continue
+              frames = [pd.read_csv(path, dtype=str) for path in (kept, saved) if os.path.exists(path)]
+              merged = pd.concat(frames, ignore_index=True).drop_duplicates()
+              merged.to_csv(kept, index=False)
+              print(f"{name}: {len(merged)} rows after merging the morning's copy.")
+          EOF
       - id: loop
         run: ./session_loop.sh 16:00
 
@@ -66,7 +112,8 @@ jobs:
     needs: [morning, afternoon]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # Starts after 12:30 at the earliest (see midday), so the wait for 16:10 fits.
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

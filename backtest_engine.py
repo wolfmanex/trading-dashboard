@@ -26,7 +26,7 @@ def run_ta_backtest(
         return result
 
     required_columns = {"Close", "EMA_9", "EMA_21", "MACD", "Signal_Line", "RSI"}
-    if not required_columns.issubset(df.columns) or len(df) <= holding_period:
+    if not required_columns.issubset(df.columns) or len(df) <= holding_period + 1:
         return result
 
     first_close, last_close = float(df["Close"].iloc[0]), float(df["Close"].iloc[-1])
@@ -36,7 +36,7 @@ def run_ta_backtest(
     returns = []
     directions = []
     index = 0
-    last_signal_index = len(df) - holding_period
+    last_signal_index = len(df) - holding_period - 1
     while index < last_signal_index:
         signal_row = df.iloc[index]
         if signal_row[list(required_columns)].isna().any():
@@ -48,7 +48,8 @@ def run_ta_backtest(
             index += 1
             continue
 
-        exit_index = index + holding_period
+        # Enter at the next bar's close and hold for holding_period bars from there
+        exit_index = index + 1 + holding_period
         entry_price = float(df["Close"].iloc[index + 1])
         exit_price = float(df["Close"].iloc[exit_index])
         if entry_price <= 0 or exit_price <= 0:

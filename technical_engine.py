@@ -250,19 +250,32 @@ def get_multi_timeframe_data(ticker: str):
     df_1h = get_technical_data(ticker, timeframe="1h")
     df_1d = get_technical_data(ticker, timeframe="1d")
 
-    if not df_1h.empty:
-        df_4h = df_1h.resample('4h').agg({
-            'Open': 'first',
-            'High': 'max',
-            'Low': 'min',
-            'Close': 'last',
-            'Volume': 'sum'
-        }).dropna()
+    df_4h = resample_to_4h(df_1h, ticker)
+    if not df_4h.empty:
         df_4h = add_technical_indicators(df_4h)
-    else:
-        df_4h = pd.DataFrame()
 
     return df_5m, df_4h, df_1d
+
+
+def resample_to_4h(df_1h: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """4h bars from 1h bars. US stocks keep only the regular session, bucketed 9:30-13:30 and 13:30-16:00 ET."""
+    if df_1h is None or df_1h.empty:
+        return pd.DataFrame()
+    df = df_1h[["Open", "High", "Low", "Close", "Volume"]]
+    ticker = ticker.strip().upper()
+    offset = None
+    if not (ticker.endswith("-USD") or ticker.endswith("=X")):  # crypto and FX have no session to filter
+        if df.index.tz is not None:
+            df = df.tz_convert(EASTERN)
+        df = df.between_time("09:30", "15:59")
+        offset = "9h30min"  # buckets start at the open instead of midnight
+    return df.resample("4h", offset=offset).agg({
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Volume': 'sum'
+    }).dropna()
 
 
 EASTERN = ZoneInfo("America/New_York")

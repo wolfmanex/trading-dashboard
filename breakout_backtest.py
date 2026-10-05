@@ -79,7 +79,7 @@ def simulate_trade(df: pd.DataFrame, signal_index: int, pivot: float, stop: floa
             exit_price = stop if same_bar else min(opens[i], stop)
             return _trade(df, signal_index, entry_index, entry, stop, target, i, exit_price, "Stop")
         if highs[i] >= target:
-            exit_price = target if same_bar else max(opens[i], target)
+            exit_price = max(entry if same_bar else opens[i], target)  # a gap above the target fills at the open
             return _trade(df, signal_index, entry_index, entry, stop, target, i, exit_price, "Target")
 
     exit_index = min(entry_index + MAX_HOLD, last)

@@ -9,6 +9,19 @@ from secrets_config import get_configured_secret
 
 # Grab Finnhub key from streamlit secrets
 FINNHUB_API_KEY = get_configured_secret("FINNHUB_API_KEY")
+FINNHUB_EARNINGS_URL = "https://finnhub.io/api/v1/calendar/earnings"
+
+
+def format_macro_value(value, suffix: str = "") -> str:
+    """Render a VIX/yield reading, or "N/A" when it could not be fetched."""
+    if value is None:
+        return "N/A"
+    try:
+        if pd.isna(value):
+            return "N/A"
+    except (TypeError, ValueError):
+        pass
+    return f"{value}{suffix}"
 
 
 def parse_news_headlines(news_items, limit: int = 5) -> list:
@@ -39,8 +52,8 @@ def get_upcoming_events(ticker: str) -> dict:
     """Fetches upcoming corporate earnings, macro indicators (VIX, 10Y Yield), and news context."""
     events = {
         "earnings_date": "N/A",
-        "macro_vix": 0.0,
-        "macro_tnx": 0.0,
+        "macro_vix": None,   # None when the download fails; format with format_macro_value() for "N/A"
+        "macro_tnx": None,
         "news_headlines": []
     }
     
@@ -50,9 +63,13 @@ def get_upcoming_events(ticker: str) -> dict:
             # Finnhub API: Get earnings calendar from today to 90 days out
             start_date = datetime.today().strftime('%Y-%m-%d')
             end_date = (datetime.today() + timedelta(days=90)).strftime('%Y-%m-%d')
-            url = f"https://finnhub.io/api/v1/calendar/earnings?from={start_date}&to={end_date}&symbol={ticker}&token={FINNHUB_API_KEY}"
-            
-            response = requests.get(url, timeout=5)
+            # The key goes in a header, never the URL, so errors can't echo it into logs or the UI.
+            response = requests.get(
+                FINNHUB_EARNINGS_URL,
+                params={"from": start_date, "to": end_date, "symbol": ticker},
+                headers={"X-Finnhub-Token": FINNHUB_API_KEY},
+                timeout=5,
+            )
             if response.status_code == 200:
                 data = response.json()
                 upcoming_dates = sorted(
@@ -61,7 +78,8 @@ def get_upcoming_events(ticker: str) -> dict:
                 if upcoming_dates:
                     events["earnings_date"] = upcoming_dates[0]
     except Exception as e:
-        print(f"Finnhub earnings lookup failed for {ticker}: {e}")
+        # Only the error type: request errors can include the URL and headers.
+        print(f"Finnhub earnings lookup failed for {ticker}: {type(e).__name__}")
 
     t = yf.Ticker(ticker)
 

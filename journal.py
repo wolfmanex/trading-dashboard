@@ -38,7 +38,8 @@ def empty_journal() -> pd.DataFrame:
 def parse_journal(text: str) -> pd.DataFrame:
     if not text.strip():
         return empty_journal()
-    journal = pd.read_csv(io.StringIO(text), dtype={"ID": str, "Ticker": str, "Notes": str, "Setup": str})
+    journal = pd.read_csv(io.StringIO(text), dtype={"ID": str, "Ticker": str, "Notes": str, "Setup": str},
+                          keep_default_na=False, na_values=[""])  # keeps tickers like "NA"
     for column in JOURNAL_COLUMNS:
         if column not in journal:
             journal[column] = None
@@ -120,6 +121,8 @@ def add_trade(journal: pd.DataFrame, ticker: str, side: str, entry_date, entry: 
         raise ValueError(f"Side must be {LONG} or {SHORT}")
     if entry <= 0 or shares <= 0:
         raise ValueError("Entry price and shares must be positive")
+    if stop <= 0:
+        raise ValueError("Stop must be positive")
     if _risk_per_share(side, entry, stop) <= 0:
         raise ValueError("The stop must be below the entry for a long and above it for a short")
     if target and (target - entry) * (1 if side == LONG else -1) <= 0:
@@ -157,6 +160,8 @@ def close_trade(journal: pd.DataFrame, trade_id: str, exit_price: float, exit_da
         raise ValueError("Exit price must be positive")
     index = match[0]
     row = journal.loc[index]
+    if pd.Timestamp(exit_date).normalize() < pd.Timestamp(row["Entry Date"]).normalize():
+        raise ValueError("Exit date can't be before the entry date")
     pnl, r = trade_result(row["Side"], float(row["Entry"]), initial_stop(row), float(row["Shares"]), float(exit_price))
     journal.loc[index, ["Status", "Exit Date", "Exit", "Exit Reason", "P&L", "R"]] = [
         CLOSED, pd.Timestamp(exit_date).strftime("%Y-%m-%d"), round(float(exit_price), 4), reason or "", pnl, r,
@@ -170,6 +175,8 @@ def update_stop(journal: pd.DataFrame, trade_id: str, stop: float) -> pd.DataFra
     match = journal.index[(journal["ID"] == trade_id) & (journal["Status"] == OPEN)]
     if match.empty:
         raise ValueError("No open trade with that ID")
+    if stop <= 0:
+        raise ValueError("Stop must be positive")
     journal.loc[match[0], "Stop"] = round(float(stop), 4)
     return journal
 
