@@ -32,7 +32,9 @@ from stock_info import get_stock_profile, format_profile_summary
 from risk_engine import position_size
 from earnings_engine import EARNINGS_WINDOW_DAYS, add_earnings_columns, get_upcoming_earnings
 from secrets_config import get_configured_secret
-from signal_log import LOG_URL, OPEN, WAITING, fetch_published_log, summarize_by_grade, summarize_log
+from signal_log import (
+    LOG_URL, OPEN, WAITING, fetch_published_log, live_pick_states, summarize_by_grade, summarize_log,
+)
 from scheduled_scan import TOP_N as ALERTED_TOP_N
 from breakout_engine import MIN_ATR_PCT, MIN_STOP_PCT
 from smallcap_screener import (
@@ -341,6 +343,34 @@ with scanner_tab:
             market = get_market_conditions()
         render_market_panel(market)
         size_factor = RISK_OFF_SIZE if market["label"] == "Risk-off" else 1.0
+
+        # Picks from the pre-market scans stay here until their signal finishes, so a stock that breaks
+        # out (and so drops off a fresh scan) is still in view.
+        try:
+            picks_log = load_signal_log()
+        except Exception as error:
+            picks_log = None
+            st.caption(f"Logged picks unavailable: {error}")
+        if picks_log is not None and not picks_log.empty:
+            live_tickers = tuple(sorted(set(picks_log.loc[picks_log["Status"].isin([WAITING, OPEN]), "Ticker"])))
+            picks = live_pick_states(picks_log, latest_closes(live_tickers))
+            if not picks.empty:
+                st.markdown("**Live picks from the morning scans**")
+                st.dataframe(
+                    picks, hide_index=True, width="stretch",
+                    column_config={
+                        "Pivot": st.column_config.NumberColumn("Pivot", format="$%.2f"),
+                        "Stop": st.column_config.NumberColumn("Stop", format="$%.2f"),
+                        "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
+                        "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                        "vs Pivot %": st.column_config.NumberColumn("vs Pivot", format="%+.1f%%"),
+                    },
+                )
+                st.caption(
+                    "A fresh scan only lists stocks still under or just over their pivot, so a pick that breaks out "
+                    "leaves the scan table but stays here until it stops out, hits target or times out. "
+                    "Prices refresh every minute."
+                )
 
         scan_results = st.session_state.scanner_results
         if scan_results is not None and scan_results.attrs.get("universe_source") == "fallback list":

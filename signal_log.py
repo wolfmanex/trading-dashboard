@@ -220,3 +220,40 @@ def summarize_by_grade(log: pd.DataFrame, max_rank: int = None) -> pd.DataFrame:
             "Total R": summary["total_r"],
         })
     return pd.DataFrame(rows, columns=columns)
+
+
+EXTENDED_PCT = 5.0   # more than this far above the pivot counts as extended (chasing)
+
+
+def live_pick_states(log: pd.DataFrame, prices: dict) -> pd.DataFrame:
+    """Logged setups still waiting or open, with the latest price and where it sits against the levels.
+
+    The scanner only lists stocks still under (or just over) their pivot, so a pick that breaks out
+    drops off the scan; this keeps it in view until its signal finishes.
+    """
+    columns = ["Ticker", "Scan Date", "AI Grade", "Status", "Pivot", "Stop", "Target", "Price", "vs Pivot %", "State"]
+    live = log[log["Status"].isin(LIVE_STATUSES)] if not log.empty else log
+    rows = []
+    for _, row in live.iterrows():
+        pivot, stop, target = float(row["Pivot"]), float(row["Stop"]), float(row["Target"])
+        price = prices.get(row["Ticker"])
+        vs_pivot = round((price / pivot - 1) * 100, 1) if price else None
+        if price is None:
+            state = "No price"
+        elif price <= stop:
+            state = "At or below stop"
+        elif price >= target:
+            state = "At target"
+        elif price < pivot:
+            state = "Below pivot"
+        elif vs_pivot > EXTENDED_PCT:
+            state = "Extended, don't chase"
+        else:
+            state = "Breaking out"
+        rows.append({
+            "Ticker": row["Ticker"], "Scan Date": row["Scan Date"],
+            "AI Grade": row["AI Grade"] if isinstance(row["AI Grade"], str) else "",
+            "Status": row["Status"], "Pivot": pivot, "Stop": stop, "Target": target,
+            "Price": price, "vs Pivot %": vs_pivot, "State": state,
+        })
+    return pd.DataFrame(rows, columns=columns)
