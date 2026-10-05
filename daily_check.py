@@ -1,13 +1,13 @@
-"""Missed-run watchdog and the evening recap, both sent to Telegram.
+"""Duplicate-run guard for the morning scan and the evening recap, sent to Telegram.
 
-Used by .github/workflows/daily-check.yml.
+Used by .github/workflows/scheduled-scan.yml and market-session.yml. GitHub's own cron never fired in
+this repo, so a daily outside trigger starts the scan, the scan starts the market session (intraday
+checks every 15 minutes), and the session ends with the recap. GitHub's cron stays on the scan as a
+backup, which is why `ran-today` exists: a second scan the same day would repeat the alerts.
 
-`watchdog` runs shortly after the morning scan should have started. GitHub sometimes drops scheduled
-runs without a word, so when no scan run exists for today it starts one through the API and says so.
-
-`recap` runs after the close. It re-checks every live signal against the day's bars, saves the log,
-and reports which setups triggered, stopped out, hit target or timed out today, how the open ones
-stand, how your journal positions closed, and whether today's scan and intraday checks actually ran.
+`recap` re-checks every live signal against the day's bars, saves the log, and reports which setups
+triggered, stopped out, hit target or timed out today, how the open ones stand, how your journal
+positions closed, and whether today's scan and intraday checks actually ran.
 """
 import argparse
 import os
@@ -29,8 +29,7 @@ from smallcap_screener import _ticker_frame
 EASTERN = ZoneInfo("America/New_York")
 API = "https://api.github.com"
 SCAN_WORKFLOW = "scheduled-scan.yml"
-ALERTS_WORKFLOW = "intraday-alerts.yml"
-EXPECTED_ALERT_RUNS = 32   # 4 per hour, 13:07-20:52 UTC
+EXPECTED_CHECKS = 25   # every 15 minutes, 9:45-15:45 New York
 EXIT_STATUSES = {"Stop", "Target", "Time exit"}
 
 
@@ -58,24 +57,22 @@ def run_line(runs: list) -> str:
         return "did NOT run today"
     run = runs[0]
     started = str(run.get("run_started_at") or run.get("created_at") or "")[11:16]
-    trigger = "scheduled" if run.get("event") == "schedule" else "started by hand or by the watchdog"
+    trigger = "GitHub's own schedule" if run.get("event") == "schedule" else "daily trigger or by hand"
     outcome = run.get("conclusion") or run.get("status") or "unknown"
     return f"ran at {started} UTC ({trigger}), {outcome}"
 
 
-def watchdog(notify) -> int:
-    today = datetime.now(timezone.utc).date()
-    if today.weekday() >= 5:
-        print("Weekend; nothing to check.")
-        return 0
-    runs = runs_today(SCAN_WORKFLOW, today)
-    if runs:
-        print(f"Morning scan {run_line(runs)}.")
-        return 0
-    github("POST", f"/actions/workflows/{SCAN_WORKFLOW}/dispatches", json={"ref": os.getenv("GITHUB_REF_NAME") or "main"})
-    notify("<b>Watchdog</b>\nGitHub did not start this morning's scan on schedule, so I started it now. "
-           "The scan results follow in a few minutes.")
-    return 0
+def already_ran(workflow: str, day: date, current_run_id: str = None) -> bool:
+    """True when an earlier run of `workflow` on `day` finished successfully or is still going.
+
+    Only runs started before this one count, so two runs queued together don't both stand down.
+    """
+    for run in runs_today(workflow, day):
+        if current_run_id and int(run.get("id", 0)) >= int(current_run_id):
+            continue
+        if run.get("conclusion") == "success" or run.get("status") in {"queued", "in_progress", "waiting"}:
+            return True
+    return False
 
 
 def format_r(value) -> str:
@@ -145,7 +142,7 @@ def journal_lines(journal_path: str, today: str) -> list:
     return lines
 
 
-def recap(log_path: str, journal_path: str, notify) -> int:
+def recap(log_path: str, journal_path: str, notify, checks: int = None) -> int:
     now = datetime.now(EASTERN)
     today = now.date().isoformat()
     log = read_log(log_path)
@@ -161,21 +158,23 @@ def recap(log_path: str, journal_path: str, notify) -> int:
     try:
         utc_day = datetime.now(timezone.utc).date()
         scan_runs = runs_today(SCAN_WORKFLOW, utc_day)
-        alert_runs = [run for run in runs_today(ALERTS_WORKFLOW, utc_day) if run.get("event") == "schedule"]
-        checks = [f"Morning scan {run_line(scan_runs)}.",
-                  f"Intraday checks ran {len(alert_runs)} of {EXPECTED_ALERT_RUNS} times."]
-        if len(alert_runs) < EXPECTED_ALERT_RUNS * 0.75:
-            checks[-1] += " GitHub skipped many of them, so some breakouts may have gone unalerted."
+        lines = [f"Morning scan {run_line(scan_runs)}."]
+        if checks is not None:
+            lines.append(f"Intraday checks ran {checks} times (every 15 minutes from 9:45 is {EXPECTED_CHECKS}).")
+            if checks < EXPECTED_CHECKS * 0.75:
+                lines[-1] += " Some breakouts may have gone unalerted."
     except Exception as error:
-        checks = [f"Could not check today's runs: {escape(str(error))}"]
-    message += ["", "<b>Checks</b>"] + checks
+        lines = [f"Could not check today's runs: {escape(str(error))}"]
+    message += ["", "<b>Checks</b>"] + lines
     notify("\n".join(message))
     return 0
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Missed-run watchdog and evening recap.")
-    parser.add_argument("mode", choices=["watchdog", "recap"])
+    parser = argparse.ArgumentParser(description="Duplicate-run guard and evening recap.")
+    parser.add_argument("mode", choices=["ran-today", "recap"])
+    parser.add_argument("--workflow", default=SCAN_WORKFLOW, help="Workflow file (ran-today).")
+    parser.add_argument("--checks", type=int, help="Intraday checks the session ran today (recap).")
     parser.add_argument("--log", default="signal_log.csv", help="Signal log CSV (recap).")
     parser.add_argument("--journal", help="Trade journal CSV (recap).")
     args = parser.parse_args(argv)
@@ -190,9 +189,15 @@ def main(argv=None) -> int:
         else:
             print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; message is in the job log only.")
 
-    if args.mode == "watchdog":
-        return watchdog(notify)
-    return recap(args.log, args.journal, notify)
+    if args.mode == "ran-today":
+        ran = already_ran(args.workflow, datetime.now(timezone.utc).date(), os.getenv("GITHUB_RUN_ID"))
+        print(f"{args.workflow} {'already ran' if ran else 'has not run'} today.")
+        output = os.getenv("GITHUB_OUTPUT")
+        if output:
+            with open(output, "a", encoding="utf-8") as handle:
+                handle.write(f"ran={'true' if ran else 'false'}\n")
+        return 0
+    return recap(args.log, args.journal, notify, args.checks)
 
 
 if __name__ == "__main__":

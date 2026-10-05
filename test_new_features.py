@@ -171,29 +171,25 @@ class DailyCheckTests(unittest.TestCase):
     def test_run_line(self):
         self.assertEqual(daily_check.run_line([]), "did NOT run today")
         run = {"run_started_at": "2026-10-05T12:47:03Z", "event": "schedule", "conclusion": "success"}
-        self.assertEqual(daily_check.run_line([run]), "ran at 12:47 UTC (scheduled), success")
+        self.assertEqual(daily_check.run_line([run]), "ran at 12:47 UTC (GitHub's own schedule), success")
 
-    def test_watchdog_starts_a_missed_scan(self):
-        notify = mock.Mock()
-        weekday = datetime(2026, 10, 5, 13, 4)
-        with mock.patch.object(daily_check, "runs_today", return_value=[]), \
-                mock.patch.object(daily_check, "github") as api, \
-                mock.patch.object(daily_check, "datetime", wraps=datetime) as fake:
-            fake.now.return_value = weekday
-            daily_check.watchdog(notify)
-        api.assert_called_once()
-        self.assertEqual(api.call_args.args[:2], ("POST", "/actions/workflows/scheduled-scan.yml/dispatches"))
-        notify.assert_called_once()
+    def test_already_ran_counts_only_earlier_runs(self):
+        runs = [{"id": 30, "status": "queued"}, {"id": 20, "conclusion": "success"}, {"id": 10, "conclusion": "failure"}]
+        with mock.patch.object(daily_check, "runs_today", return_value=runs):
+            self.assertTrue(daily_check.already_ran("scheduled-scan.yml", date(2026, 10, 6), "25"))
+            self.assertFalse(daily_check.already_ran("scheduled-scan.yml", date(2026, 10, 6), "15"))
+        with mock.patch.object(daily_check, "runs_today", return_value=[{"id": 9, "status": "in_progress"}]):
+            self.assertTrue(daily_check.already_ran("scheduled-scan.yml", date(2026, 10, 6), "12"))
 
-    def test_watchdog_does_nothing_when_the_scan_ran(self):
+    def test_recap_reports_the_check_count(self):
         notify = mock.Mock()
-        with mock.patch.object(daily_check, "runs_today", return_value=[{"event": "schedule"}]), \
-                mock.patch.object(daily_check, "github") as api, \
-                mock.patch.object(daily_check, "datetime", wraps=datetime) as fake:
-            fake.now.return_value = datetime(2026, 10, 5, 13, 4)
-            daily_check.watchdog(notify)
-        api.assert_not_called()
-        notify.assert_not_called()
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(daily_check, "runs_today", return_value=[]):
+            daily_check.recap(os.path.join(folder, "log.csv"), None, notify, checks=10)
+        text = notify.call_args.args[0]
+        self.assertIn("Morning scan did NOT run today", text)
+        self.assertIn("Intraday checks ran 10 times", text)
+        self.assertIn("may have gone unalerted", text)
 
 
 class LivePickTests(unittest.TestCase):

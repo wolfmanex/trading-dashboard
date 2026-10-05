@@ -14,8 +14,10 @@ Streamlit dashboard with multi-timeframe charts, a small-cap breakout scanner, a
 (Gemini) with follow-up questions, a market conditions panel, a trade journal and a forward track record
 of the scanner's signals.
 
-GitHub Actions run the weekday pre-market scan (Telegram top 10 plus an AI brief), intraday breakout and
-journal stop/target alerts, a watchdog that starts the scan if GitHub skipped it, and an evening recap.
+GitHub Actions run the weekday pre-market scan (Telegram top 10 plus an AI brief), then a market session
+with breakout and journal stop/target alerts every 15 minutes, then an evening recap. GitHub's own cron never
+fired in this repo, so a daily Claude routine starts the scan (weekdays 8:33 New York) and each step starts
+the next; the scan's cron stays as a backup and a second scan on the same day stands down.
 
 The block at the top of this file is the Hugging Face Spaces configuration: the Space builds the
 `Dockerfile` and serves the app on port 7860.
