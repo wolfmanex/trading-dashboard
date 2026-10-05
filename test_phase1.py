@@ -137,7 +137,7 @@ class TechnicalEngineTests(unittest.TestCase):
             "RSI": [50.0] * 7,
         })
 
-        result = run_ta_backtest(data, holding_period=2)
+        result = run_ta_backtest(data, holding_period=1)
 
         # Signals at bars 1 and 3 (bar 0 closes on EMA 21); the second waits for the first exit
         self.assertEqual(result["total_trades"], 2)
@@ -153,7 +153,7 @@ class TechnicalEngineTests(unittest.TestCase):
             "RSI": [50.0] * 7,
         })
 
-        result = run_ta_backtest(data, holding_period=3)
+        result = run_ta_backtest(data, holding_period=2)
 
         # Signals at bars 0 and 3 only: entry 1 -> exit 3, then entry 4 -> exit 6
         self.assertEqual(result["total_trades"], 2)
@@ -169,7 +169,7 @@ class TechnicalEngineTests(unittest.TestCase):
             "RSI": [50.0] * 4,
         })
 
-        result = run_ta_backtest(data, holding_period=2, cost_per_trade_pct=1.0)
+        result = run_ta_backtest(data, holding_period=1, cost_per_trade_pct=1.0)
 
         self.assertEqual(result["total_trades"], 1)
         self.assertAlmostEqual(result["average_return_pct"], 7.33, places=2)

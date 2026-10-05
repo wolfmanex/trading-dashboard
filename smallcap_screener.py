@@ -204,12 +204,14 @@ def scan_smallcap_breakouts(
     tickers = sorted(universe)
 
     try:
+        # Unadjusted prices, so pivot/stop/target match the real quotes the outcome checks and live
+        # prices use (auto_adjust=True shifts history around ex-dividend dates).
         batch = yf.download(
             tickers=tickers + [BENCHMARK],
             period="1y",
             interval="1d",
             group_by="ticker",
-            auto_adjust=True,
+            auto_adjust=False,
             progress=False,
             threads=True,
         )

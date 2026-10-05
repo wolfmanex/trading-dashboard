@@ -10,6 +10,7 @@ signal_log.py).
 """
 import argparse
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from html import escape
@@ -108,13 +109,37 @@ def build_report(results, regime: dict, earnings_note: str, top_n: int = TOP_N, 
     return "\n".join(markdown), "\n".join(html)
 
 
+TELEGRAM_LIMIT = 4000   # Telegram allows 4096 characters per message; leave some room
+
+
+def telegram_chunks(html: str, limit: int = TELEGRAM_LIMIT) -> list:
+    """Split a message on line boundaries into pieces under `limit`, so no HTML tag is cut in half.
+
+    A single line longer than the limit loses its tags (escaped text stays escaped) and is cut short.
+    """
+    chunks, current = [], ""
+    for line in html.split("\n"):
+        if len(line) > limit:
+            line = re.sub(r"<[^>]*>", "", line)[:limit]
+            line = re.sub(r"&[#a-zA-Z0-9]*$", "", line)   # don't end on half an entity
+        if current and len(current) + 1 + len(line) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current.strip():
+        chunks.append(current)
+    return chunks
+
+
 def send_telegram(token: str, chat_id: str, html: str) -> None:
-    response = requests.post(
-        TELEGRAM_URL.format(token=token),
-        json={"chat_id": chat_id, "text": html[:4000], "parse_mode": "HTML", "disable_web_page_preview": True},
-        timeout=20,
-    )
-    response.raise_for_status()
+    for chunk in telegram_chunks(html):
+        response = requests.post(
+            TELEGRAM_URL.format(token=token),
+            json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=20,
+        )
+        response.raise_for_status()
 
 
 def download_outcome_prices(log: pd.DataFrame) -> tuple:

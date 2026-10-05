@@ -1,6 +1,7 @@
 import yfinance as yf
 import pandas as pd
 import requests
+import streamlit as st
 from datetime import date, datetime
 
 
@@ -42,6 +43,7 @@ def has_valid_bid_ask(option) -> bool:
     return bool(pd.notna(bid) and pd.notna(ask) and bid >= 0 and ask >= bid and ask > 0)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def get_options_sentiment(ticker: str, analysis_mode: str = "Intra-Day (Scalp/Day Trade)") -> dict:
     """Fetches Options Open Interest, PCR, and Strike Walls.
        Iterates through expirations if the nearest one is missing data."""
@@ -80,7 +82,12 @@ def get_options_sentiment(ticker: str, analysis_mode: str = "Intra-Day (Scalp/Da
         # 3. Prefer expirations near the selected strategy horizon.
         candidate_expirations = select_expiration_candidates(expirations, analysis_mode)[:3]
         for target_exp in candidate_expirations:
-            chain = tk.option_chain(target_exp)
+            try:
+                chain = tk.option_chain(target_exp)
+            except Exception as e:
+                # One bad expiration shouldn't hide the others
+                print(f"Option chain {target_exp} failed for {ticker}: {e}")
+                continue
             
             # Clean the data: Drop rows where Open Interest is NaN or exactly 0
             calls = chain.calls.dropna(subset=['openInterest', 'strike'])

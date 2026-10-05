@@ -33,7 +33,7 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Skip if today's scan already ran
+      - name: Skip if today's scan already ran or the market is closed
         id: guard
         if: ${{ !inputs.force }}
         env:
@@ -74,9 +74,16 @@ jobs:
             git pull --rebase origin signal-log
           done
           exit 1
+      - name: Check for today's market session
+        # A rerun of the scan (e.g. with force) must not start a second session and a second recap.
+        id: session
+        if: always() && steps.guard.outputs.ran != 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python daily_check.py session-started
       - name: Start the market session
         # Even after a failed scan: the session still watches yesterday's waiting setups and the journal.
-        if: always() && steps.guard.outputs.ran != 'true'
+        if: always() && steps.guard.outputs.ran != 'true' && steps.session.outputs.started != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run market-session.yml --ref "${{ github.ref_name }}"

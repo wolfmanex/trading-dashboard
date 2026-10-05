@@ -77,12 +77,13 @@ def get_swing_metrics(ticker: str, analysis_mode: str = "Intra-Day (Scalp/Day Tr
         sector_etf = SECTOR_MAP.get(ticker, "SPY") # Default to S&P 500 if not mapped
         metrics["sector_etf"] = sector_etf
         
-        tk_hist = tk.history(period="5d")
-        etf_hist = yf.Ticker(sector_etf).history(period="5d")
+        # 1mo of history so iloc[-6] (five sessions back) gives a full week of change
+        tk_hist = tk.history(period="1mo")
+        etf_hist = yf.Ticker(sector_etf).history(period="1mo")
         
-        if len(tk_hist) >= 5 and len(etf_hist) >= 5:
-            tk_perf = ((tk_hist['Close'].iloc[-1] - tk_hist['Close'].iloc[0]) / tk_hist['Close'].iloc[0]) * 100
-            etf_perf = ((etf_hist['Close'].iloc[-1] - etf_hist['Close'].iloc[0]) / etf_hist['Close'].iloc[0]) * 100
+        if len(tk_hist) >= 6 and len(etf_hist) >= 6:
+            tk_perf = ((tk_hist['Close'].iloc[-1] - tk_hist['Close'].iloc[-6]) / tk_hist['Close'].iloc[-6]) * 100
+            etf_perf = ((etf_hist['Close'].iloc[-1] - etf_hist['Close'].iloc[-6]) / etf_hist['Close'].iloc[-6]) * 100
             
             rs_score = round(tk_perf - etf_perf, 2)
             metrics["relative_strength_1w"] = rs_score
