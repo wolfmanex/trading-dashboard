@@ -1,10 +1,9 @@
 import json
-import math
 import pandas as pd
-import streamlit as st
 from google import genai
 
 from secrets_config import get_configured_secret
+from trade_levels import STOP_ATR, TARGET_R, format_recent_bars, horizon
 
 
 # Initialize Google Generative AI Client
@@ -48,312 +47,223 @@ def format_dataframe_summary(df: pd.DataFrame, tf_label: str = "5m") -> str:
     return summary
 
 
-def validate_synthesis_result(result: dict) -> dict:
-    """Validate and normalize the model response before it reaches the UI."""
+def generate_json(prompt: str):
+    """Send a prompt in JSON mode and parse the reply; raises on a missing key or unparseable output."""
+    if gemini_client is None:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config={"temperature": 0.2, "response_mime_type": "application/json"},
+    )
+    clean_text = (response.text or "").replace("```json", "").replace("```", "").strip()
+    if not clean_text:
+        raise ValueError("The model returned an empty response")
+    return json.loads(clean_text, strict=False)
+
+
+TRADE_VERDICTS = {"GO", "WAIT", "SKIP"}
+TRADE_DIRECTIONS = {"LONG", "SHORT", "NONE"}
+TRADE_GRADES = {"A", "B", "C"}
+RISK_LEVELS = {"LOW", "MEDIUM", "HIGH", "EXTREME"}
+
+
+def _bullets(value) -> list:
+    """Accept a list or a newline/bullet string and return clean bullet texts."""
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, str):
+        items = value.splitlines()
+    else:
+        items = []
+    cleaned = [str(item).strip().lstrip("-*• ").strip() for item in items]
+    return [item for item in cleaned if item]
+
+
+def validate_trade_review(result: dict, levels: dict) -> dict:
+    """Validate and normalize the reviewer's JSON against the plans that were actually offered."""
     if not isinstance(result, dict):
         raise ValueError("AI response must be a JSON object")
 
-    required_fields = {
-        "signal",
-        "confidence",
-        "timeframe_confluence",
-        "execution_plan",
-        "higher_tf_breakdown",
-        "intraday_tf_breakdown",
-        "macro_analysis",
-        "news_catalyst_analysis",
-        "catalyst_scenarios",
-        "detailed_reasoning",
+    direction = str(result.get("direction", "")).strip().upper()
+    verdict = str(result.get("verdict", "")).strip().upper()
+    grade = str(result.get("grade", "")).strip().upper()
+    if direction not in TRADE_DIRECTIONS:
+        raise ValueError(f"Unsupported AI direction: {direction or 'missing'}")
+    if verdict not in TRADE_VERDICTS:
+        raise ValueError(f"Unsupported AI verdict: {verdict or 'missing'}")
+    if grade not in TRADE_GRADES:
+        raise ValueError(f"Unsupported AI grade: {grade or 'missing'}")
+
+    notes = []
+    if direction != "NONE" and not levels.get(direction.lower()):
+        notes.append(f"The reviewer chose {direction}, but no {direction} plan was offered, so it is shown as no trade.")
+        direction = "NONE"
+    if direction == "NONE" and verdict == "GO":
+        verdict = "SKIP"
+
+    risk = str(result.get("risk_level", "")).strip().upper()
+    return {
+        "direction": direction,
+        "verdict": verdict,
+        "grade": grade,
+        "risk_level": risk if risk in RISK_LEVELS else "HIGH",
+        "summary": str(result.get("summary", "")).strip(),
+        "trigger": str(result.get("trigger", "")).strip(),
+        "technical_notes": _bullets(result.get("technical_notes")),
+        "catalyst_notes": _bullets(result.get("catalyst_notes")),
+        "risks": _bullets(result.get("risks")),
+        "scenarios": _bullets(result.get("scenarios")),
+        "validation_notes": notes,
     }
-    missing_fields = required_fields.difference(result)
-    if missing_fields:
-        raise ValueError(f"AI response missing fields: {sorted(missing_fields)}")
-
-    signal = str(result["signal"]).upper()
-    if signal not in {"BUY", "SELL", "HOLD"}:
-        raise ValueError(f"Unsupported AI signal: {signal}")
-    result["signal"] = signal
-
-    confidence = result["confidence"]
-    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
-        raise ValueError("AI confidence must be numeric")
-    if confidence > 1:
-        confidence /= 100
-    if not math.isfinite(confidence) or not 0 <= confidence <= 1:
-        raise ValueError("AI confidence must be between 0 and 1")
-    result["confidence"] = confidence
-
-    if not isinstance(result["execution_plan"], dict):
-        raise ValueError("AI execution_plan must be an object")
-
-    return result
 
 
-MAX_LEVEL_DISTANCE = 0.30  # plan levels further than this from the current price are flagged
+def format_plan(name: str, plan: dict) -> str:
+    if not plan:
+        return f"- {name}: not offered."
+    return (
+        f"- {name}: entry {plan['entry']:.2f} | stop {plan['stop']:.2f} | target {plan['target']:.2f} "
+        f"| reward/risk {plan['reward_risk']}:1"
+    )
 
 
-def parse_plan_level(value):
-    """Read a plan level that may be a number, a numeric string, or an 'a - b' zone (midpoint)."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value) if math.isfinite(value) and value > 0 else None
-    if not isinstance(value, str):
-        return None
-    parts = [part.strip().replace(",", "").replace("USD", "").replace("$", "").strip()
-             for part in value.replace("–", "-").split(" - ")]
-    try:
-        numbers = [float(part) for part in parts if part]
-    except ValueError:
-        return None
-    if not numbers or any(number <= 0 for number in numbers):
-        return None
-    return sum(numbers) / len(numbers)
+def format_scanner_context(scanner_row: dict, context: dict) -> str:
+    if not scanner_row:
+        return "Not from the breakout scanner."
+    context = context or {}
+    return (
+        f"- Found by the small-cap breakout scanner: {scanner_row.get('Base Weeks', 'N/A')}-week base, "
+        f"{scanner_row.get('Base Depth', 'N/A')}% deep, latest RVOL {scanner_row.get('RVOL', 'N/A')}, "
+        f"3-month RS vs IWM {scanner_row.get('RS vs IWM', 'N/A')}%, breakout score {scanner_row.get('Breakout Score', 'N/A')}/100\n"
+        f"- Market cap: {scanner_row.get('Market Cap', 'N/A')} USD | Float: {context.get('float_shares', 'N/A')} shares "
+        f"| Short % of float: {context.get('short_pct_float', 'N/A')} | Insider %: {context.get('insider_pct', 'N/A')}\n"
+        f"- Sector / Industry: {context.get('sector', 'N/A')} / {context.get('industry', 'N/A')}"
+    )
 
 
-def check_execution_plan(result: dict, current_price: float) -> list:
-    """Return human-readable problems with the AI trade plan's levels; an empty list means it passed.
-
-    Checks that BUY plans have stop < entry < target (SELL the reverse), that levels sit near the
-    current price, and that the stated risk/reward matches the levels.
-    """
-    if not isinstance(result, dict):
-        return []
-    plan = result.get("execution_plan") or {}
-    signal = str(result.get("signal", "HOLD")).upper()
-    entry = parse_plan_level(plan.get("entry_zone"))
-    stop = parse_plan_level(plan.get("stop_loss"))
-    target = parse_plan_level(plan.get("take_profit"))
-    issues = []
-
-    if signal in {"BUY", "SELL"}:
-        missing = [name for name, value in (("entry", entry), ("stop loss", stop), ("take profit", target)) if value is None]
-        if missing:
-            issues.append(f"The plan has no usable {', '.join(missing)} level.")
-        elif signal == "BUY" and not stop < entry < target:
-            issues.append(
-                f"A BUY needs stop < entry < target, but the plan has stop {stop:.2f}, entry {entry:.2f}, target {target:.2f}."
-            )
-        elif signal == "SELL" and not target < entry < stop:
-            issues.append(
-                f"A SELL needs target < entry < stop, but the plan has target {target:.2f}, entry {entry:.2f}, stop {stop:.2f}."
-            )
-        else:
-            stated = str(plan.get("risk_reward_ratio", ""))
-            actual = abs(target - entry) / abs(entry - stop)
-            stated_parts = stated.replace(" ", "").split(":")
-            try:
-                stated_ratio = float(stated_parts[1]) / float(stated_parts[0]) if len(stated_parts) == 2 else float(stated)
-            except (ValueError, ZeroDivisionError):
-                stated_ratio = None
-            if stated_ratio is not None and abs(stated_ratio - actual) > max(0.3, 0.25 * actual):
-                issues.append(
-                    f"The stated risk/reward ({stated}) does not match the levels, which give 1:{actual:.1f}."
-                )
-
-    if current_price and current_price > 0:
-        for name, value in (("Entry", entry), ("Stop loss", stop), ("Take profit", target)):
-            if value is not None and abs(value - current_price) / current_price > MAX_LEVEL_DISTANCE:
-                issues.append(
-                    f"{name} {value:.2f} is {abs(value - current_price) / current_price:.0%} away from the current price {current_price:.2f}."
-                )
-    return issues
-
-
-def synthesize_signals(
-    ticker: str, 
-    df_5m: pd.DataFrame = None, 
-    df_4h: pd.DataFrame = None, 
-    df_1d: pd.DataFrame = None, 
+def review_trade_setup(
+    ticker: str,
+    price: float,
+    levels: dict,
+    analysis_mode: str,
+    df_5m: pd.DataFrame = None,
+    df_4h: pd.DataFrame = None,
+    df_1d: pd.DataFrame = None,
     df_1w: pd.DataFrame = None,
-    sentiment_summary: str = "",
     event_data: dict = None,
     options_data: dict = None,
     swing_metrics: dict = None,
     intraday_metrics: dict = None,
-    analysis_mode: str = "Intra-Day (Scalp/Day Trade)"
+    scanner_row: dict = None,
+    scanner_context: dict = None,
 ) -> dict:
-    """Synthesizes technical, macro, options, swing, and intraday metrics into an institutional trade decision."""
-    
-    if event_data is None:
-        event_data = {
-            "earnings_date": "N/A", 
-            "days_until_earnings": "N/A", 
-            "proximity_flag": "N/A", 
-            "macro_vix": 0.0, 
-            "macro_tnx": 0.0, 
-            "news_headlines": []
-        }
+    """Ask the model to judge a trade whose levels were calculated in code (see trade_levels.py).
 
-    if options_data is None:
-        options_data = {"pcr_oi": "N/A", "call_wall": "N/A", "put_wall": "N/A", "positioning_summary": "N/A"}
+    Returns {"review": dict | None, "error": str | None}. The model picks a direction among the
+    offered plans and grades the setup; it never sets prices.
+    """
+    event_data = event_data or {}
+    options_data = options_data or {}
+    swing_metrics = swing_metrics or {}
+    intraday_metrics = intraday_metrics or {}
+    is_intraday = "Intra-Day" in str(analysis_mode)
 
-    if swing_metrics is None:
-        swing_metrics = {"expected_move_usd": "N/A", "upper_expected_bound": "N/A", "lower_expected_bound": "N/A", "sector_etf": "SPY", "relative_strength_1w": "N/A", "rs_rating": "N/A"}
-
-    if intraday_metrics is None:
-        intraday_metrics = {"vwap": "N/A", "pdh": "N/A", "pdl": "N/A", "pmh": "N/A", "pml": "N/A", "rvol": "N/A"}
-
-    tech_5m = format_dataframe_summary(df_5m, "5m")
-    tech_4h = format_dataframe_summary(df_4h, "4h")
-    tech_1d = format_dataframe_summary(df_1d, "1d")
-    tech_1w = format_dataframe_summary(df_1w, "1w") if df_1w is not None else "Timeframe [1w]: Omitted for Intraday Mode."
-
-    headlines = event_data.get("news_headlines", [])
-    headlines_str = "\n".join(headlines) if headlines else "No recent high-impact headlines."
+    headlines = event_data.get("news_headlines") or (scanner_context or {}).get("headlines") or []
+    headlines_str = "\n".join(f"  {headline}" for headline in headlines) or "  No recent headlines."
+    timeframes = [format_dataframe_summary(df_1d, "1d"), format_dataframe_summary(df_4h, "4h")]
+    if is_intraday:
+        timeframes.insert(0, format_dataframe_summary(df_5m, "5m"))
+    else:
+        timeframes.append(format_dataframe_summary(df_1w, "1w"))
+    recent_bars = [format_recent_bars(df_1d, 20, "Last 20 daily bars")]
+    if is_intraday:
+        recent_bars.append(format_recent_bars(df_5m, 24, "Last 24 five-minute bars"))
+    atr = levels.get("atr")
+    level_source = (
+        "the breakout scanner (pivot buy-stop, base stop, measured-move target; long only)"
+        if levels.get("source") == "scanner" else
+        f"the daily ATR ({atr} USD): stop {STOP_ATR[horizon(analysis_mode)]} ATR from the current price, "
+        f"target {TARGET_R:.0f}R"
+    )
 
     prompt = f"""
-You are an institutional Lead Quantitative Strategist analyzing **{ticker}**.
-Execution Strategy Horizon: **{analysis_mode}**
+You are reviewing a possible trade in **{ticker}** for an individual trader. Horizon: **{analysis_mode}**.
+Current price: {price:.2f} USD.
 
-### 1. TECHNICAL INDICATORS MATRIX:
-{tech_5m}
-{tech_4h}
-{tech_1d}
-{tech_1w}
+The trade levels below were calculated in code from {level_source}. Do not change them or invent other
+prices. Your job is to judge whether either plan is worth taking now, should wait for a trigger, or
+should be skipped, and to point out what the numbers cannot show.
 
-### 2. INTRADAY LIQUIDITY & SESSION LEVELS:
-- Session VWAP: USD {intraday_metrics.get('vwap', 'N/A')}
-- Relative Volume (RVOL): {intraday_metrics.get('rvol', 'N/A')}
-- Prior Day High (PDH) / Low (PDL): USD {intraday_metrics.get('pdh', 'N/A')} / USD {intraday_metrics.get('pdl', 'N/A')}
-- Pre-Market High (PMH) / Low (PML): USD {intraday_metrics.get('pmh', 'N/A')} / USD {intraday_metrics.get('pml', 'N/A')}
+### TRADE PLANS
+{format_plan("LONG", levels.get("long"))}
+{format_plan("SHORT", levels.get("short"))}
+- Recent 20-day support (lowest low): {levels.get("support", "N/A")} | resistance (highest high): {levels.get("resistance", "N/A")}
+- Daily ATR(14): {atr if atr is not None else "N/A"} USD
 
-### 3. OPTIONS POSITIONING & WEEKLY EXPECTED MOVE:
-- Put/Call Open Interest Ratio (PCR-OI): {options_data.get('pcr_oi', 'N/A')}
-- Major Resistance (Call Wall Strike): USD {options_data.get('call_wall', 'N/A')}
-- Major Support (Put Wall Strike): USD {options_data.get('put_wall', 'N/A')}
-- **Weekly Expected Move:** +/- USD {swing_metrics.get('expected_move_usd', 'N/A')}
-- **Expected Upper Bound:** USD {swing_metrics.get('upper_expected_bound', 'N/A')} | **Expected Lower Bound:** USD {swing_metrics.get('lower_expected_bound', 'N/A')}
+### PRICE ACTION
+{chr(10).join(recent_bars)}
 
-### 4. MACRO, SECTOR RELATIVE STRENGTH & EVENT ENVIRONMENT:
-- Sector Benchmark Used: {swing_metrics.get('sector_etf', 'SPY')}
-- 1-Week Sector Relative Strength: {swing_metrics.get('relative_strength_1w', 'N/A')}% ({swing_metrics.get('rs_rating', 'N/A')})
-- Market Volatility Index (VIX): {event_data.get('macro_vix', 'N/A')}
-- 10-Year Treasury Yield (^TNX): {event_data.get('macro_tnx', 'N/A')}%
-- Upcoming Corporate Earnings Date: {event_data.get('earnings_date', 'N/A')}
-- Days Until Earnings: {event_data.get('days_until_earnings', 'N/A')}
-- Earnings Proximity Flag: {event_data.get('proximity_flag', 'N/A')}
+### INDICATORS
+{chr(10).join(timeframes)}
 
-### 5. SENTIMENT & CATALYST HEADLINES:
-- Overall Sentiment Summary: {sentiment_summary}
-- News Headlines:
+### SESSION LEVELS
+- VWAP {intraday_metrics.get("vwap", "N/A")} | RVOL {intraday_metrics.get("rvol", "N/A")}
+- Prior day high/low {intraday_metrics.get("pdh", "N/A")} / {intraday_metrics.get("pdl", "N/A")}
+- Pre-market high/low {intraday_metrics.get("pmh", "N/A")} / {intraday_metrics.get("pml", "N/A")}
+
+### SCANNER CONTEXT
+{format_scanner_context(scanner_row, scanner_context)}
+
+### CONTEXT
+- Relative strength vs {swing_metrics.get("sector_etf", "SPY")} over 1 week: {swing_metrics.get("relative_strength_1w", "N/A")}% ({swing_metrics.get("rs_rating", "N/A")})
+- Options-implied weekly expected move: +/- {swing_metrics.get("expected_move_usd", "N/A")} USD
+- Options put/call OI ratio {options_data.get("pcr_oi", "N/A")}, call wall {options_data.get("call_wall", "N/A")}, put wall {options_data.get("put_wall", "N/A")}
+- VIX {event_data.get("macro_vix", "N/A")} | US 10-year yield {event_data.get("macro_tnx", "N/A")}%
+- Next earnings: {event_data.get("earnings_date", "N/A")} ({event_data.get("days_until_earnings", "N/A")} days away)
+- Today: {pd.Timestamp.today().strftime("%Y-%m-%d")}
+- Headlines:
 {headlines_str}
 
----
+### HOW TO JUDGE
+- Pick the direction that fits the trend and structure, or NONE if neither plan has an edge. Only choose a
+  direction whose plan is offered above.
+- Verdict GO: the setup is valid now. WAIT: valid but needs a trigger first (say exactly what in `trigger`,
+  e.g. "a close above 12.40 on volume above the 20-day average"). SKIP: no edge or the risk is not worth it.
+- Grade A: clean setup, stop below real structure, supportive trend and catalyst. B: valid with minor concerns.
+  C: undermined by structure, trend, liquidity or event risk.
+- Check whether the stop sits beyond the recent support/resistance or inside the noise (compare with ATR),
+  and whether the target runs into nearby resistance/support.
+- Earnings within 5 days are binary risk: say so, and fill `scenarios` with a bull case, a bear case and how
+  to handle the position. Otherwise leave `scenarios` empty.
+- Options data is often missing or thin for small caps; mention it only when it is present and meaningful.
+- You are not given an economic calendar. Do not state dates for FOMC, CPI or other macro events.
+- If information is missing, say so instead of guessing. Never use the '$' symbol; write prices as numbers.
 
-### STRATEGIC & FORMATTING INSTRUCTIONS:
-- **Intra-Day Mode**: Prioritize Session VWAP, PDH/PDL sweeps, RVOL, 5m momentum, and tight stop losses. If RVOL is < 0.8, reduce confidence due to low liquidity. Avoid taking trades directly into PMH/PML resistance/support.
-- **Weekly Mode**: Heavy emphasis on 1d/1w structural trend, options Call/Put Walls, Sector Relative Strength (RS), and Expected Move bounds. 
-- **CRITICAL**: If your Take Profit or Stop Loss targets exceed the "Weekly Expected Move Bounds", explicitly state that the trade represents an outlier volatility bet.
-- **MANDATORY INCLUSION**: You MUST explicitly analyze the Put/Call Open Interest Ratio (PCR-OI) and Options Strike Walls inside your `macro_analysis` or `higher_tf_breakdown` text fields. Do not omit this options data.
-- **No Dollar Signs ($)**: NEVER use the '$' symbol in descriptive text explanations or reasoning fields, as it triggers UI rendering bugs. Write prices as numbers or USD.
-- **Bullet Points**: Write all breakdown fields ('higher_tf_breakdown', 'intraday_tf_breakdown', 'macro_analysis', 'news_catalyst_analysis') as clean, bulleted markdown points starting with '- '.
-
-🚨 CRITICAL PROXIMITY RULES (EARNINGS EVENT HORIZON) 🚨
-You must inspect the `days_until_earnings` and `proximity_flag` fields:
-
-1. IF `proximity_flag` == 'IMMEDIATE_BINARY_RISK' (0-2 Days):
-   - RISK LEVEL: Must be set to 'HIGH' or 'EXTREME'.
-   - SWING STRATEGY: Explicitly state that holding shares/naked options into the release is a BINARY GAMBLE. Recommend closing positions before the bell or hedging via options spreads (e.g., defined-risk structures).
-
-2. IF `proximity_flag` == 'SWING_WINDOW_OVERLAP' (3-5 Days):
-   - SWING STRATEGY: You MUST factor earnings into the trade duration. 
-   - Mandatory note: State whether this setup is a "Pre-Earnings Run Up Play" (exiting BEFORE the report) or if the binary risk outweighs the technical setup.
-   - IV CRUSH WARNING: Warn that IV expansion will inflate option premiums and IV crush will destroy post-earnings long options.
-
-3. IF `proximity_flag` == 'OUTSIDE_SWING_WINDOW' (> 5 Days):
-   - Standard technical/swing rules apply.
-
-🚨 CRITICAL RULE: CATALYST COLLISION CHECK 🚨
-Cross-reference the `earnings_date` with macro events and `news_headlines`. 
-If a stock's earnings report or proximity window occurs near or on a major macroeconomic catalyst (e.g., FOMC Rate Decision, Fed decision, CPI release, NFP), you MUST:
-1. Elevate overall risk assessment to HIGH or EXTREME.
-2. Explicitly flag the "Macro/Micro Catalyst Collision" inside your `news_catalyst_analysis` field.
-3. Adjust your execution plan to account for binary, multi-directional volatility (e.g., wider stop losses, defined-risk structures, or exiting before the catalyst).
-
-🚨 CATALYST SCENARIO REASONING 🚨
-If `days_until_earnings` is <= 5, or a major macro event is imminent, you MUST generate predictive scenarios in the `catalyst_scenarios` field:
-1. Bull Case Reaction: What structural levels must break for a sustained rally? (Reference Call Walls and Resistance).
-2. Bear Case Reaction: Where is the ultimate capitulation level if the catalyst fails? (Reference Put Walls and Support).
-3. Tactical Play: Suggest the optimal institutional approach (e.g., "Wait for T+1 post-earnings drift", "Delta-neutral straddle", or "Close 80% of position pre-market").
-
-Synthesize all data and output strictly a SINGLE valid JSON object matching this schema without any outer explanation or extra text:
-
+Output strictly one JSON object:
 {{
-  "signal": "BUY",
-  "confidence": 0.85,
-  "timeframe_confluence": "Bullish Confluence Across 5m/1d holding above Session VWAP",
-  "execution_plan": {{
-    "entry_zone": "145.20 - 145.80",
-    "take_profit": 152.00,
-    "stop_loss": 142.50,
-    "risk_reward_ratio": "1:2.3",
-    "key_support": 142.00,
-    "key_resistance": 153.50,
-    "swing_upper_limit": 155.00,
-    "swing_lower_limit": 138.00
-  }},
-  "higher_tf_breakdown": "- Daily structural analysis remains bullish above 21 EMA.\n- Put Wall at 140.00 USD provides strong institutional hedging floor.",
-  "intraday_tf_breakdown": "- Price cleared PMH and is retesting Session VWAP as support.\n- RVOL at 1.4 confirms strong participation.",
-  "macro_analysis": "- Options PCR-OI at 0.58 indicates strong smart money call accumulation.\n- Stock showing Strong Relative Strength vs XLK (+2.4%).",
-  "news_catalyst_analysis": "- Upcoming earnings catalyst presents low immediate risk.",
-  "catalyst_scenarios": "- Bull Case: Price gaps above 153.50 Call Wall, triggering a gamma squeeze toward 160.\n- Bear Case: Forward guidance misses, breaking 142 support and dropping to 138 swing limit.\n- Tactical Play: Do not hold directional calls through the bell due to IV Crush. Wait for T+1 morning settlement to trade the post-earnings drift.",
-  "detailed_reasoning": "Comprehensive thesis unifying technicals, options OI walls, relative strength, VWAP levels, and expected move guidelines."
+  "direction": "LONG",
+  "verdict": "WAIT",
+  "grade": "B",
+  "risk_level": "MEDIUM",
+  "summary": "One sentence verdict a trader can act on.",
+  "trigger": "What must happen before entering, or what confirms the entry.",
+  "technical_notes": ["Short bullet on trend, structure, stop and target placement"],
+  "catalyst_notes": ["Short bullet on news, earnings or the lack of a catalyst"],
+  "risks": ["Each concrete risk as a short phrase"],
+  "scenarios": []
 }}
 """
 
     try:
-        if gemini_client is None:
-            raise RuntimeError("GEMINI_API_KEY is not configured")
-
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config={"temperature": 0.2},
-        )
-        
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-        result_json = json.loads(clean_text, strict=False)
-        return validate_synthesis_result(result_json)
-
+        review = validate_trade_review(generate_json(prompt), levels)
+        return {"review": review, "error": None}
     except Exception as e:
-        print(f"LLM Synthesis Engine Error: {e}")
-        return {
-            "signal": "HOLD",
-            "confidence": 0.0,
-            "timeframe_confluence": "Error generating synthesis",
-            "execution_plan": {
-                "entry_zone": "N/A", "take_profit": 0.0, "stop_loss": 0.0,
-                "risk_reward_ratio": "N/A", "key_support": 0.0, "key_resistance": 0.0,
-                "swing_upper_limit": 0.0, "swing_lower_limit": 0.0
-            },
-            "higher_tf_breakdown": "- Higher timeframe synthesis unavailable.",
-            "intraday_tf_breakdown": "- Intraday timeframe synthesis unavailable.",
-            "macro_analysis": f"- API Exception: {str(e)}",
-            "news_catalyst_analysis": "- N/A",
-            "catalyst_scenarios": "- Scenario modeling unavailable due to API error.",
-            "detailed_reasoning": f"An error occurred during AI analysis generation: {str(e)}"
-        }
+        print(f"Trade Review Engine Error: {e}")
+        return {"review": None, "error": str(e)}
 
-def generate_ai_analysis(ticker: str, df: pd.DataFrame) -> str:
-    if df is None or df.empty:
-        return "Insufficient data for AI analysis."
-    data_summary = format_dataframe_summary(df, "Primary")
-    prompt = f"Provide a brief 3-bullet technical breakdown for {ticker} based on:\n{data_summary}"
-    try:
-        if gemini_client is None:
-            raise RuntimeError("GEMINI_API_KEY is not configured")
-
-        resp = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        return resp.text
-    except Exception as e:
-        return f"Analysis unavailable: {e}"
 
 BREAKOUT_GRADES = {"A", "B", "C"}
-BREAKOUT_RISK_LEVELS = {"LOW", "MEDIUM", "HIGH", "EXTREME"}
+BREAKOUT_RISK_LEVELS = RISK_LEVELS
 
 
 def validate_breakout_reviews(result: dict, candidate_tickers) -> dict:
@@ -452,17 +362,7 @@ Output strictly one JSON object, with one review per candidate, matching this sc
 """
 
     try:
-        if gemini_client is None:
-            raise RuntimeError("GEMINI_API_KEY is not configured")
-
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config={"temperature": 0.2, "response_mime_type": "application/json"},
-        )
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-        result_json = json.loads(clean_text, strict=False)
-        reviews = validate_breakout_reviews(result_json, [c["Ticker"] for c in candidates])
+        reviews = validate_breakout_reviews(generate_json(prompt), [c["Ticker"] for c in candidates])
         return {"reviews": reviews, "error": None}
     except Exception as e:
         print(f"Breakout Review Engine Error: {e}")

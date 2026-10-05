@@ -27,7 +27,7 @@ jobs:
         # The log lives on its own branch so the daily commit doesn't touch main or redeploy the app.
         run: |
           if git ls-remote --exit-code --heads origin signal-log; then
-            git fetch --depth=1 origin signal-log:refs/remotes/origin/signal-log
+            git fetch origin signal-log:refs/remotes/origin/signal-log
             git worktree add -B signal-log signal-log-data origin/signal-log
           else
             git worktree add --orphan -b signal-log signal-log-data
@@ -35,6 +35,8 @@ jobs:
       - name: Run scan
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scheduled_scan.py --log signal-log-data/signal_log.csv
@@ -45,6 +47,12 @@ jobs:
           [ -f signal_log.csv ] || exit 0
           git add signal_log.csv
           git diff --cached --quiet && exit 0
-          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit -m "Signal log $(TZ=America/New_York date +%F)"
-          git push origin signal-log
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Signal log $(TZ=America/New_York date +%F)"
+          # The intraday alerts job also pushes to this branch; rebase onto it if it got there first.
+          for attempt in 1 2 3; do
+            git push origin signal-log && exit 0
+            git pull --rebase origin signal-log
+          done
+          exit 1

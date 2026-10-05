@@ -13,10 +13,8 @@ from technical_engine import (
 )
 from news_engine import get_ticker_news_sentiment
 from index_filter import get_macro_market_trend
-from llm_engine import (
-    generate_ai_analysis, synthesize_signals, is_ai_configured, review_breakout_candidates, check_execution_plan,
-    parse_plan_level,
-)
+from llm_engine import is_ai_configured, review_breakout_candidates, review_trade_setup
+from trade_levels import STOP_ATR, TARGET_R, compute_trade_plans
 from event_engine import get_upcoming_events
 from options_engine import get_options_sentiment
 from swing_engine import get_swing_metrics
@@ -29,7 +27,7 @@ from stock_info import get_stock_profile, format_profile_summary
 from risk_engine import position_size
 from earnings_engine import EARNINGS_WINDOW_DAYS, add_earnings_columns, get_upcoming_earnings
 from secrets_config import get_configured_secret
-from signal_log import LOG_URL, OPEN, WAITING, fetch_published_log, summarize_log
+from signal_log import LOG_URL, OPEN, WAITING, fetch_published_log, summarize_by_grade, summarize_log
 from scheduled_scan import TOP_N as ALERTED_TOP_N
 from smallcap_screener import (
     get_candidate_context, get_smallcap_universe, scan_smallcap_breakouts,
@@ -483,7 +481,7 @@ with dashboard_tab:
             ("Technicals", "#technical-chart"),
             ("Catalysts", "#catalysts"),
             ("Backtest", "#backtest"),
-            ("AI Analysis", "#ai-analysis"),
+            ("AI Review", "#ai-analysis"),
         ]
         for column, (label, anchor) in zip(view_columns, view_links):
             with column:
@@ -711,16 +709,18 @@ with dashboard_tab:
         fig.update_yaxes(showgrid=False, row=2, col=1)
 
         # Overlay breakout levels when the selected asset came from the scanner
+        scanner_row = None
         if scan_results is not None and not scan_results.empty and selected_ticker in set(scan_results["Ticker"]):
-            breakout_row = scan_results.loc[scan_results["Ticker"] == selected_ticker].iloc[0]
+            scanner_row = scan_results.loc[scan_results["Ticker"] == selected_ticker].iloc[0].to_dict()
+        if scanner_row:
             for level, label, color in (
                 ("Pivot", "Pivot", CHART_BLUE),
                 ("Stop", "Stop", CHART_DOWN),
                 ("Target", "Target", CHART_UP),
             ):
                 fig.add_hline(
-                    y=breakout_row[level], line_dash="dash", line_color=color, line_width=1,
-                    annotation_text=f"{label} {breakout_row[level]:.2f}", annotation_font_color=color,
+                    y=scanner_row[level], line_dash="dash", line_color=color, line_width=1,
+                    annotation_text=f"{label} {scanner_row[level]:.2f}", annotation_font_color=color,
                     row=1, col=1,
                 )
 
@@ -798,166 +798,125 @@ with dashboard_tab:
 
         st.divider()
 
-        # Callback to run multi-timeframe LLM synthesis cleanly with Macro Context
-        def run_synthesis_callback():
-            with st.spinner("Fetching multi-horizon data, options OI & macro signals..."):
+        # The reviewer judges levels calculated in code (trade_levels.py); it never sets prices itself
+        def run_review_callback():
+            with st.spinner("Fetching multi-timeframe data, options and session levels for the AI review..."):
                 df_5m, df_4h, df_1d = get_multi_timeframe_data(selected_ticker)
                 df_1w = get_technical_data(selected_ticker, timeframe="1w")
                 options_data = get_options_sentiment(selected_ticker, analysis_mode=analysis_mode)
                 swing_metrics = get_swing_metrics(selected_ticker, analysis_mode=analysis_mode)
                 intraday_metrics = get_intraday_metrics(selected_ticker)
+                scanner_context = get_candidate_context(selected_ticker) if scanner_row else None
+                levels = compute_trade_plans(latest_price, df_1d, analysis_mode, scanner_row)
 
-                st.session_state.llm_analysis = synthesize_signals(
+            with st.spinner("Running AI review..."):
+                result = review_trade_setup(
                     ticker=selected_ticker,
+                    price=latest_price,
+                    levels=levels,
+                    analysis_mode=analysis_mode,
                     df_5m=df_5m,
                     df_4h=df_4h,
                     df_1d=df_1d,
                     df_1w=df_1w,
-                    sentiment_summary=sentiment_summary,
                     event_data=event_data,
                     options_data=options_data,
                     swing_metrics=swing_metrics,
                     intraday_metrics=intraday_metrics,
-                    analysis_mode=analysis_mode,
+                    scanner_row=scanner_row,
+                    scanner_context=scanner_context,
                 )
+            st.session_state.llm_analysis = {**result, "levels": levels, "price": latest_price, "mode": analysis_mode}
 
-        # Section: AI Synthesis Control
+        # Section: AI Trade Review
         st.markdown('<div id="ai-analysis"></div>', unsafe_allow_html=True)
         col_title, col_btn = st.columns([3, 1])
 
         with col_title:
-            st.subheader("Multi-Timeframe AI Synthesis")
-
+            st.subheader("AI Trade Review")
+            st.caption(
+                "Entry, stop and target are calculated in code: the scanner's levels for a scanner pick, otherwise "
+                f"{STOP_ATR['swing']} daily ATR (swing) or {STOP_ATR['intraday']} ATR (intraday) stops with a "
+                f"{TARGET_R:.0f}R target. The AI picks a direction, grades the setup and says go, wait or skip."
+            )
             if not is_ai_configured():
-                st.warning("AI analysis is disabled: configure GEMINI_API_KEY in Streamlit secrets or the environment.")
+                st.warning("AI review is disabled: configure GEMINI_API_KEY in Streamlit secrets or the environment.")
 
         with col_btn:
-            btn_label = "Regenerate Analysis" if st.session_state.llm_analysis else "Run AI Analysis"
-            st.button(btn_label, on_click=run_synthesis_callback, width="stretch")
+            btn_label = "Re-run AI Review" if st.session_state.llm_analysis else "Run AI Review"
+            st.button(btn_label, on_click=run_review_callback, width="stretch", disabled=not is_ai_configured())
 
-        # Render Multi-Factor Deep AI Results
-        if st.session_state.llm_analysis:
-            res = st.session_state.llm_analysis
-    
-            if isinstance(res, dict):
-                signal = str(res.get('signal', 'HOLD')).upper()
-                confidence = int(res.get('confidence', 0) * 100) if res.get('confidence', 0) <= 1 else int(res.get('confidence', 0))
-                alignment = res.get('timeframe_confluence', 'N/A')
-        
-                # Color coding for Signal Banner
-                if signal == "BUY":
-                    badge_class, banner_class = "badge-bullish", "signal-bullish"
-                elif signal == "SELL":
-                    badge_class, banner_class = "badge-bearish", "signal-bearish"
-                else:
-                    badge_class, banner_class = "badge-neutral", "signal-neutral"
+        analysis = st.session_state.llm_analysis
+        if analysis and analysis.get("error"):
+            st.error(f"AI review failed, so there is no verdict: {analysis['error']}")
+        elif analysis:
+            review, levels = analysis["review"], analysis["levels"]
+            direction, verdict = review["direction"], review["verdict"]
+            if verdict == "GO" and direction == "LONG":
+                badge_class, banner_class = "badge-bullish", "signal-bullish"
+            elif verdict == "GO" and direction == "SHORT":
+                badge_class, banner_class = "badge-bearish", "signal-bearish"
+            else:
+                badge_class, banner_class = "badge-neutral", "signal-neutral"
+            verdict_text = verdict if direction == "NONE" else f"{verdict} {direction}"
 
-                # --- Top Level Signal Summary Banner ---
-                st.markdown(f"""
+            st.markdown(f"""
         <div class="signal-banner {banner_class}">
             <div class="signal-title">
-                Signal: {escape(signal)}
-                <span class="signal-confidence">Confidence: <strong>{confidence}%</strong></span>
+                Verdict: {escape(verdict_text)}
+                <span class="signal-confidence">Grade <strong>{escape(review['grade'])}</strong> | Risk <strong>{escape(review['risk_level'])}</strong></span>
             </div>
-            <span class="kpi-badge {badge_class}">Alignment: {escape(str(alignment))}</span>
+            <span class="kpi-badge {badge_class}">{escape(review['summary'] or 'No summary provided.')}</span>
         </div>
         """, unsafe_allow_html=True)
-        
-                ## --- Institutional Execution Plan Cards ---
-                plan = res.get('execution_plan', {})
-                st.subheader("Trade Execution Plan")
-                plan_issues = check_execution_plan(res, latest_price)
-                if plan_issues:
-                    st.warning(
-                        "**Plan check failed.** Treat these levels with caution:\n"
-                        + "\n".join(f"- {issue}" for issue in plan_issues)
-                    )
-                elif signal in ("BUY", "SELL"):
-                    st.caption(f"Plan check passed: levels are ordered for a {signal} and sit near the current price.")
-        
-                tp_val = plan.get('take_profit', 0.0)
-                sl_val = plan.get('stop_loss', 0.0)
-                up_limit = plan.get('swing_upper_limit', 'N/A')
-                low_limit = plan.get('swing_lower_limit', 'N/A')
-        
-                # Row 1: Core Trade Targets
-                p_col1, p_col2, p_col3, p_col4 = st.columns(4)
-                with p_col1:
-                    st.metric("Target Entry Zone", f"${plan.get('entry_zone', 'N/A')}")
-                with p_col2:
-                    st.metric("Take Profit Target", f"${tp_val:.2f}" if isinstance(tp_val, (int, float)) else str(tp_val))
-                with p_col3:
-                    st.metric("Stop Loss Level", f"${sl_val:.2f}" if isinstance(sl_val, (int, float)) else str(sl_val))
-                with p_col4:
-                    st.metric("Risk / Reward Ratio", str(plan.get('risk_reward_ratio', 'N/A')))
+            if review["trigger"]:
+                st.markdown(f"**Trigger:** {sanitize_ai_text(review['trigger'])}")
+            for note in review["validation_notes"]:
+                st.caption(note)
 
-                plan_entry, plan_stop = parse_plan_level(plan.get('entry_zone')), parse_plan_level(plan.get('stop_loss'))
-                plan_size = (
-                    position_size(account_size, risk_pct, plan_entry, plan_stop)
-                    if signal in ("BUY", "SELL") and not plan_issues and plan_entry and plan_stop else None
-                )
+            st.subheader("Trade Plan")
+            plan = levels.get(direction.lower()) if direction != "NONE" else None
+            if plan:
+                p_col1, p_col2, p_col3, p_col4 = st.columns(4)
+                p_col1.metric("Entry", f"${plan['entry']:.2f}")
+                p_col2.metric("Stop Loss", f"${plan['stop']:.2f}")
+                p_col3.metric("Target", f"${plan['target']:.2f}")
+                p_col4.metric("Reward / Risk", f"{plan['reward_risk']}:1" if plan["reward_risk"] else "N/A")
+                plan_size = position_size(account_size, risk_pct, plan["entry"], plan["stop"])
                 if plan_size:
                     st.caption(
                         f"Position size: **{plan_size['shares']:,} shares** ({plan_size['position_value']:,.0f} USD), "
                         f"risking {plan_size['dollar_risk']:,.0f} USD ({risk_pct:.2f}% of {account_size:,.0f} USD) "
-                        f"from entry {plan_entry:.2f} to stop {plan_stop:.2f}"
+                        f"from entry {plan['entry']:.2f} to stop {plan['stop']:.2f}"
                         + (". Capped at the account size, so the risk is below budget." if plan_size["capped_by_account"] else ".")
                     )
-            
-                # Row 2: Expected Move Swing Limits
-                l_col1, l_col2, l_col3, l_col4 = st.columns(4)
-                with l_col1:
-                    st.metric("Swing Lower Bound (1SD)", f"${low_limit:.2f}" if isinstance(low_limit, (int, float)) else str(low_limit))
-                with l_col2:
-                    st.metric("Swing Upper Bound (1SD)", f"${up_limit:.2f}" if isinstance(up_limit, (int, float)) else str(up_limit))
-        
-                st.markdown("<br>", unsafe_allow_html=True)
-        
-                # --- Multi-Factor Breakdown Section ---
-                st.subheader("Multi-Factor Analysis Breakdown")
-        
-                tab_tech, tab_macro, tab_news, tab_scenarios = st.tabs([
-                    "📊 Technical Structure",
-                    "🌐 Macro Regime & Risk",
-                    "📰 Catalysts & Headlines",
-                    "🎲 Catalyst Scenarios"
-                ])
-        
-                with tab_tech:
-                    t_col1, t_col2 = st.columns(2)
-                    with t_col1:
-                        st.markdown("**Higher Timeframe (Macro Trend):**")
-                        st.markdown(sanitize_ai_text(res.get('higher_tf_breakdown', 'N/A')))
-                    with t_col2:
-                        st.markdown("**Intraday Setup (Trigger):**")
-                        st.markdown(sanitize_ai_text(res.get('intraday_tf_breakdown', 'N/A')))
-            
-                    st.markdown("---")
-                    s_col1, s_col2 = st.columns(2)
-                    supp_val = plan.get('key_support', 0.0)
-                    rest_val = plan.get('key_resistance', 0.0)
-                    s_col1.metric("Key Technical Support", f"${supp_val:.2f}" if isinstance(supp_val, (int, float)) else str(supp_val))
-                    s_col2.metric("Key Technical Resistance", f"${rest_val:.2f}" if isinstance(rest_val, (int, float)) else str(rest_val))
-
-                with tab_macro:
-                    st.markdown(sanitize_ai_text(res.get('macro_analysis', 'N/A')))
-
-                with tab_news:
-                    st.markdown(sanitize_ai_text(res.get('news_catalyst_analysis', 'N/A')))
-
-                with tab_scenarios:
-                    st.markdown(sanitize_ai_text(res.get('catalyst_scenarios', 'N/A')))
-
-                st.markdown("<br>", unsafe_allow_html=True)
-
-                # --- Comprehensive Thesis ---
-                with st.expander("Complete AI Thesis & Strategic Commentary", expanded=True):
-                    st.markdown(sanitize_ai_text(res.get('detailed_reasoning', 'N/A')))
-
+            elif levels.get("source") is None:
+                st.caption("No plan: there was not enough daily history to calculate the ATR.")
             else:
-                st.markdown(sanitize_ai_text(str(res)))
+                st.caption("No trade: the reviewer did not pick a direction.")
+            level_source = "breakout scanner" if levels.get("source") == "scanner" else "daily ATR"
+            s_col1, s_col2, s_col3 = st.columns(3)
+            for column, label, value in (
+                (s_col1, "20-Day Support", levels.get("support")),
+                (s_col2, "20-Day Resistance", levels.get("resistance")),
+                (s_col3, "Daily ATR (14)", levels.get("atr")),
+            ):
+                column.metric(label, f"${value:.2f}" if isinstance(value, (int, float)) else "N/A")
+            st.caption(
+                f"Levels from the {level_source}, reviewed at {analysis['price']:.2f} in "
+                f"{analysis['mode']} mode."
+            )
+
+            tab_labels = ["Technical", "Catalysts", "Risks"] + (["Scenarios"] if review["scenarios"] else [])
+            review_tabs = st.tabs(tab_labels)
+            for tab, key in zip(review_tabs, ["technical_notes", "catalyst_notes", "risks", "scenarios"]):
+                with tab:
+                    items = review[key]
+                    st.markdown(
+                        "\n".join(f"- {sanitize_ai_text(item)}" for item in items) if items else "Nothing noted."
+                    )
         else:
-            st.info("Click 'Run AI Analysis' above to generate a multi-timeframe unified trade decision.")
+            st.info("Click 'Run AI Review' to have the AI grade a trade plan for this ticker.")
 
 with track_tab:
     if track_tab.open:
@@ -1004,6 +963,23 @@ with track_tab:
             st.caption(" | ".join(details))
             if summary["trades"] < 30:
                 st.caption("Fewer than 30 closed trades so far, so these numbers are still mostly noise.")
+
+            by_grade = summarize_by_grade(signal_log, max_rank=ALERTED_TOP_N if scope.startswith("Top") else None)
+            if not by_grade.empty and (by_grade["AI Grade"] != "Ungraded").any():
+                st.markdown("**By AI grade**")
+                st.dataframe(
+                    by_grade, hide_index=True, width="stretch",
+                    column_config={
+                        "Win Rate %": st.column_config.NumberColumn("Win Rate", format="%.1f%%"),
+                        "Average R": st.column_config.NumberColumn("Average R", format="%+.2f"),
+                        "Total R": st.column_config.NumberColumn("Total R", format="%+.1f"),
+                    },
+                )
+                st.caption(
+                    "The scheduled scan grades the top setups with the AI reviewer before the open, so these grades "
+                    "were set before the outcome was known. If A-grades don't beat C-grades over time, the AI review "
+                    "isn't adding anything."
+                )
 
             table = signal_log.copy()
             if scope.startswith("Top"):

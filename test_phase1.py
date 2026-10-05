@@ -10,24 +10,27 @@ from watchlist_engine import normalize_watchlist
 from movers_engine import rank_movers
 from stock_info import format_profile_summary
 from intraday_engine import calculate_relative_volume
-from llm_engine import validate_synthesis_result
+from llm_engine import validate_trade_review
 from options_engine import has_valid_bid_ask, option_midpoint, select_expiration_candidates
 from technical_engine import add_technical_indicators, tag_data_source, validate_ohlcv_data
 
 
-def valid_synthesis_result():
+def valid_trade_review():
     return {
-        "signal": "buy",
-        "confidence": 85,
-        "timeframe_confluence": "Bullish alignment",
-        "execution_plan": {},
-        "higher_tf_breakdown": "- Trend is bullish.",
-        "intraday_tf_breakdown": "- Momentum is improving.",
-        "macro_analysis": "- Macro trend is supportive.",
-        "news_catalyst_analysis": "- No immediate catalyst risk.",
-        "catalyst_scenarios": "- Bull case remains valid.",
-        "detailed_reasoning": "The technical inputs are aligned.",
+        "direction": "long",
+        "verdict": "wait",
+        "grade": "b",
+        "risk_level": "medium",
+        "summary": "Valid base, wait for the pivot.",
+        "trigger": "A close above 12.40 on volume.",
+        "technical_notes": "- Above the rising 50-day.\n- Stop sits under the base low.",
+        "catalyst_notes": ["No catalyst in the headlines."],
+        "risks": ["Thin float"],
+        "scenarios": [],
     }
+
+
+LONG_ONLY_LEVELS = {"long": {"entry": 12.4, "stop": 11.5, "target": 14.2, "reward_risk": 2.0}, "short": None}
 
 
 class TechnicalEngineTests(unittest.TestCase):
@@ -288,33 +291,43 @@ class OptionsMetricTests(unittest.TestCase):
         self.assertFalse(has_valid_bid_ask(option))
 
 
-class SynthesisValidationTests(unittest.TestCase):
+class TradeReviewValidationTests(unittest.TestCase):
     def test_valid_response_is_normalized(self):
-        result = validate_synthesis_result(valid_synthesis_result())
+        review = validate_trade_review(valid_trade_review(), LONG_ONLY_LEVELS)
 
-        self.assertEqual(result["signal"], "BUY")
-        self.assertEqual(result["confidence"], 0.85)
+        self.assertEqual((review["direction"], review["verdict"], review["grade"]), ("LONG", "WAIT", "B"))
+        self.assertEqual(review["risk_level"], "MEDIUM")
+        self.assertEqual(review["technical_notes"], ["Above the rising 50-day.", "Stop sits under the base low."])
+        self.assertEqual(review["validation_notes"], [])
 
-    def test_invalid_signal_is_rejected(self):
-        result = valid_synthesis_result()
-        result["signal"] = "MAYBE"
-
-        with self.assertRaises(ValueError):
-            validate_synthesis_result(result)
-
-    def test_missing_required_field_is_rejected(self):
-        result = valid_synthesis_result()
-        del result["execution_plan"]
+    def test_invalid_verdict_is_rejected(self):
+        result = valid_trade_review()
+        result["verdict"] = "MAYBE"
 
         with self.assertRaises(ValueError):
-            validate_synthesis_result(result)
+            validate_trade_review(result, LONG_ONLY_LEVELS)
 
-    def test_out_of_range_confidence_is_rejected(self):
-        result = valid_synthesis_result()
-        result["confidence"] = 150
+    def test_missing_grade_is_rejected(self):
+        result = valid_trade_review()
+        del result["grade"]
 
         with self.assertRaises(ValueError):
-            validate_synthesis_result(result)
+            validate_trade_review(result, LONG_ONLY_LEVELS)
+
+    def test_direction_without_an_offered_plan_becomes_no_trade(self):
+        result = valid_trade_review()
+        result.update(direction="SHORT", verdict="GO")
+
+        review = validate_trade_review(result, LONG_ONLY_LEVELS)
+
+        self.assertEqual((review["direction"], review["verdict"]), ("NONE", "SKIP"))
+        self.assertIn("no SHORT plan", review["validation_notes"][0])
+
+    def test_unknown_risk_level_defaults_to_high(self):
+        result = valid_trade_review()
+        result["risk_level"] = "spicy"
+
+        self.assertEqual(validate_trade_review(result, LONG_ONLY_LEVELS)["risk_level"], "HIGH")
 
 
 if __name__ == "__main__":

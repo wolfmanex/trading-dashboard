@@ -10,7 +10,7 @@ import pandas as pd
 import scheduled_scan
 from signal_log import (
     LOG_COLUMNS, NOT_TRIGGERED, OPEN, WAITING, append_signals, benchmark_return, empty_log,
-    evaluate_signal, read_log, summarize_log, update_outcomes,
+    evaluate_signal, read_log, summarize_by_grade, summarize_log, update_outcomes,
 )
 
 
@@ -154,6 +154,56 @@ class SummaryAndStorageTests(unittest.TestCase):
         self.assertEqual(list(restored.columns), LOG_COLUMNS)
         self.assertEqual(list(restored["Status"]), ["Target", "Stop", OPEN, WAITING, NOT_TRIGGERED])
         self.assertTrue(read_log("/nonexistent/signal_log.csv").empty)
+
+
+class GradeTests(unittest.TestCase):
+    def test_ai_grades_are_logged_and_summarized_per_grade(self):
+        results = scan_results(["A", "B", "C", "D"])
+        results["AI Grade"] = ["A", "A", "C", ""]
+        results["AI Risk"] = ["LOW", "MEDIUM", "HIGH", ""]
+        log = append_signals(empty_log(), results, date(2026, 10, 5))
+        log["Status"] = ["Target", "Stop", "Stop", WAITING]
+        log["R"] = [3.0, -1.0, -1.0, None]
+
+        self.assertEqual(list(log["AI Risk"].iloc[:3]), ["LOW", "MEDIUM", "HIGH"])
+        table = summarize_by_grade(log).set_index("AI Grade")
+        self.assertEqual(list(table.index), ["A", "C", "Ungraded"])
+        self.assertEqual(table.loc["A", "Closed Trades"], 2)
+        self.assertEqual(table.loc["A", "Average R"], 1.0)
+        self.assertEqual(table.loc["C", "Win Rate %"], 0.0)
+        self.assertEqual(table.loc["Ungraded", "Signals"], 1)
+
+    def test_old_logs_without_grade_columns_read_as_ungraded(self):
+        buffer = io.StringIO("Scan Date,Ticker,Rank,Status\n2026-10-01,OLD,1,Waiting\n")
+        log = read_log(buffer)
+        self.assertEqual(list(summarize_by_grade(log)["AI Grade"]), ["Ungraded"])
+        self.assertTrue(summarize_by_grade(empty_log()).empty)
+
+    def test_scan_grades_the_top_setups(self):
+        results = scan_results(["AAA", "BBB", "CCC"])
+        reviews = {"AAA": {"grade": "A", "risk_level": "LOW"}, "BBB": {"grade": "C", "risk_level": "HIGH"}}
+        with mock.patch.object(scheduled_scan, "is_ai_configured", return_value=True), \
+                mock.patch.object(scheduled_scan, "get_candidate_context", return_value={}), \
+                mock.patch.object(scheduled_scan, "review_breakout_candidates",
+                                  return_value={"reviews": reviews, "error": None}) as review:
+            note = scheduled_scan.grade_top_setups(results, top_n=2)
+        self.assertEqual(len(review.call_args.args[0]), 2)
+        self.assertEqual(list(results["AI Grade"]), ["A", "C", ""])
+        self.assertIn("AI graded 2 of the top 2", note)
+        markdown, html = scheduled_scan.build_report(results, {"label": "Uptrend"}, "", ai_note=note)
+        self.assertIn("A (LOW risk)", markdown)
+        self.assertIn("AI C (HIGH risk)", html)
+
+    def test_scan_without_a_key_or_with_an_ai_error_leaves_setups_ungraded(self):
+        results = scan_results(["AAA"])
+        with mock.patch.object(scheduled_scan, "is_ai_configured", return_value=False):
+            self.assertIn("GEMINI_API_KEY", scheduled_scan.grade_top_setups(results))
+        with mock.patch.object(scheduled_scan, "is_ai_configured", return_value=True), \
+                mock.patch.object(scheduled_scan, "get_candidate_context", return_value={}), \
+                mock.patch.object(scheduled_scan, "review_breakout_candidates",
+                                  return_value={"reviews": {}, "error": "quota"}):
+            self.assertIn("quota", scheduled_scan.grade_top_setups(results))
+        self.assertNotIn("AI Grade", results)
 
 
 class ScheduledScanLogTests(unittest.TestCase):
