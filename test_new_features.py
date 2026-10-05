@@ -196,6 +196,20 @@ class DailyCheckTests(unittest.TestCase):
         notify.assert_not_called()
 
 
+class LivePickTests(unittest.TestCase):
+    def test_states_against_the_levels(self):
+        from signal_log import live_pick_states
+        log = empty_log().reindex(range(5))
+        log["Ticker"] = ["A", "B", "C", "D", "E"]
+        log["Status"] = ["Waiting", "Waiting", "Open", "Waiting", "Stop"]
+        log["Pivot"], log["Stop"], log["Target"] = 10.0, 9.0, 14.0
+        prices = {"A": 9.5, "B": 10.3, "C": 11.0, "D": 8.8, "E": 12.0}
+        picks = live_pick_states(log, prices)
+        self.assertEqual(list(picks["Ticker"]), ["A", "B", "C", "D"])
+        self.assertEqual(list(picks["State"]), ["Below pivot", "Breaking out", "Extended, don't chase", "At or below stop"])
+        self.assertEqual(picks.iloc[2]["vs Pivot %"], 10.0)
+
+
 class BriefAndFollowUpTests(unittest.TestCase):
     def test_brief_lists_top_graded_setups(self):
         results = pd.DataFrame({"Ticker": ["AAA", "BBB", "CCC", "DDD", "EEE"]})

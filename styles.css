@@ -450,3 +450,58 @@ code, .stCode { font-family: var(--mono); }
     .system-status-bar > div:nth-child(even) { border-left: none; border-top: var(--line); }
     .system-status-bar > div:first-child { border-top: none; }
 }
+
+/* ---------- Fit the main column, not the window ----------
+   With the sidebar open the main column can be ~600px on a 1024px screen, where the viewport media
+   queries above don't apply. Size by the column's own width instead, and let labels wrap rather than
+   cut off with an ellipsis. */
+.block-container { container: main / inline-size; }
+
+[data-testid="stButton"] button p,
+[data-testid="stFormSubmitButton"] button p {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.2;
+}
+
+[data-testid="stMetricValue"] { font-size: clamp(1.15rem, 3.2cqi, 2.25rem); }
+
+[data-testid="stMetricDelta"] { max-width: 100%; height: auto; }
+
+[data-testid="stMetricValue"] > div,
+[data-testid="stMetricDelta"] > div,
+[data-testid="stMetricDelta"] p {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    overflow-wrap: anywhere;
+}
+
+/* Status cells wrap onto as many rows as the width needs; the negative margins tuck each cell's
+   left/top rule under its neighbour's so every inner line is one rule thick. */
+.system-status-bar {
+    display: flex;
+    flex-wrap: wrap;
+    overflow: hidden;
+}
+
+.system-status-bar > div,
+.system-status-bar > div:first-child,
+.system-status-bar > div:nth-child(even) {
+    flex: 1 1 150px;
+    border-left: var(--line);
+    border-top: var(--line);
+    margin: -2px 0 0 -2px;
+}
+
+.system-status-bar .status-value {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+@container main (max-width: 760px) {
+    .view-button { font-size: 0.68rem; letter-spacing: 0.02em; padding: 0.55rem 0.3rem; }
+    .metric-container { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .kpi-value { flex-direction: column; align-items: flex-start; font-size: 1.25rem; }
+    .kpi-badge { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+}
