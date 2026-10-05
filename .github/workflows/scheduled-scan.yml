@@ -1,17 +1,26 @@
 name: Scheduled breakout scan
 
+# A daily outside trigger (a Claude routine, weekdays 8:33 New York) starts this with workflow_dispatch,
+# because GitHub's cron never fired in this repo. The cron stays as a backup; whichever run comes second
+# on a day finds the first and stops, so alerts aren't sent twice. When the scan is done it starts the
+# market session (intraday checks, then the evening recap).
 on:
   schedule:
-    # 12:41 UTC on weekdays: 8:41 New York in summer, 7:41 in winter, before the open. Off the top of
-    # the hour on purpose: GitHub delays or drops scheduled runs most often at :00.
+    # 12:41 UTC on weekdays: 8:41 New York in summer, 7:41 in winter, before the open.
     - cron: "41 12 * * 1-5"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Scan again even if today's scan already ran"
+        type: boolean
+        default: false
 
 # The scan commits the signal log, so two runs must not race each other's push.
 concurrency: scheduled-scan
 
 permissions:
   contents: write
+  actions: write   # find today's other runs and start the market session
 
 jobs:
   scan:
@@ -24,7 +33,14 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Skip if today's scan already ran
+        id: guard
+        if: ${{ !inputs.force }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python daily_check.py ran-today --workflow scheduled-scan.yml
       - name: Check out the signal log branch
+        if: steps.guard.outputs.ran != 'true'
         # The log lives on its own branch so the daily commit doesn't touch main or redeploy the app.
         run: |
           if git ls-remote --exit-code --heads origin signal-log; then
@@ -34,6 +50,7 @@ jobs:
             git worktree add --orphan -b signal-log signal-log-data
           fi
       - name: Run scan
+        if: steps.guard.outputs.ran != 'true'
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -42,7 +59,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scheduled_scan.py --log signal-log-data/signal_log.csv
       - name: Save the signal log
-        if: always()
+        if: always() && steps.guard.outputs.ran != 'true'
         working-directory: signal-log-data
         run: |
           [ -f signal_log.csv ] || exit 0
@@ -57,3 +74,9 @@ jobs:
             git pull --rebase origin signal-log
           done
           exit 1
+      - name: Start the market session
+        # Even after a failed scan: the session still watches yesterday's waiting setups and the journal.
+        if: always() && steps.guard.outputs.ran != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run market-session.yml --ref "${{ github.ref_name }}"

@@ -1,0 +1,105 @@
+name: Market session
+
+# Started by the morning scan once it finishes. Checks the logged setups and the journal's open
+# positions every 15 minutes through the session (intraday_alerts.py), then sends the evening recap.
+# GitHub's cron never fired in this repo, so this runs as one long dispatched session instead of a
+# schedule. A job may run 6 hours at most, so the session is split at 12:30 New York.
+on:
+  workflow_dispatch:
+
+concurrency: market-session
+
+permissions:
+  contents: write   # sent alerts and the recap's signal-log update
+  actions: read     # the recap reports today's scan run
+
+env:
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+jobs:
+  morning:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    outputs:
+      checks: ${{ steps.loop.outputs.checks }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Check out the signal log branch
+        run: |
+          git fetch origin signal-log:refs/remotes/origin/signal-log
+          git worktree add -B signal-log signal-log-data origin/signal-log
+          git -C signal-log-data config user.name "github-actions[bot]"
+          git -C signal-log-data config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - id: loop
+        run: ./session_loop.sh 12:30
+
+  afternoon:
+    needs: morning
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    outputs:
+      checks: ${{ steps.loop.outputs.checks }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Check out the signal log branch
+        run: |
+          git fetch origin signal-log:refs/remotes/origin/signal-log
+          git worktree add -B signal-log signal-log-data origin/signal-log
+          git -C signal-log-data config user.name "github-actions[bot]"
+          git -C signal-log-data config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - id: loop
+        run: ./session_loop.sh 16:00
+
+  recap:
+    needs: [morning, afternoon]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Wait for the close
+        # Daily bars settle a few minutes after 16:00 New York.
+        run: |
+          while [[ "$(TZ=America/New_York date +%H:%M)" < "16:10" ]]; do sleep 60; done
+      - name: Check out the signal log branch
+        run: |
+          git fetch origin signal-log:refs/remotes/origin/signal-log
+          git worktree add -B signal-log signal-log-data origin/signal-log
+      - name: Recap
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MORNING_CHECKS: ${{ needs.morning.outputs.checks }}
+          AFTERNOON_CHECKS: ${{ needs.afternoon.outputs.checks }}
+        run: >
+          python daily_check.py recap --log signal-log-data/signal_log.csv --journal signal-log-data/journal.csv
+          --checks $(( ${MORNING_CHECKS:-0} + ${AFTERNOON_CHECKS:-0} ))
+      - name: Save the signal log
+        working-directory: signal-log-data
+        run: |
+          git add signal_log.csv
+          git diff --cached --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Signal log close $(TZ=America/New_York date +%F)"
+          for attempt in 1 2 3; do
+            git push origin signal-log && exit 0
+            git pull --rebase origin signal-log
+          done
+          exit 1

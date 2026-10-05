@@ -1,6 +1,6 @@
 """Telegram alert when a scanner setup breaks its pivot on volume during market hours.
 
-Used by .github/workflows/intraday-alerts.yml, which runs every 15 minutes on weekdays. It watches the
+Run every 15 minutes through the session by session_loop.sh (.github/workflows/market-session.yml). It watches the
 top setups the pre-market scan logged that are still waiting to trigger (see signal_log.py), and
 alerts once per ticker per day when the price is at or above the pivot and the day's volume so far
 runs at least MIN_RVOL times the 20-day average for this point in the session. Sent alerts are kept
