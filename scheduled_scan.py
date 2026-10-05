@@ -3,7 +3,8 @@
 Used by .github/workflows/scheduled-scan.yml. Results always go to stdout and, on GitHub Actions,
 to the job summary. When TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set they are also sent to
 Telegram. When GEMINI_API_KEY is set the top setups are graded by the AI reviewer before anything is
-sent, and the grade is logged with the signal so the Track Record can compare grades. With --log PATH
+sent, the grade is logged with the signal so the Track Record can compare grades, and a second
+message (the AI brief) gives the catalyst and red flags for the top BRIEF_N. With --log PATH
 the setups are also added to the signal log and every live signal's outcome is re-checked (see
 signal_log.py).
 """
@@ -21,35 +22,58 @@ import yfinance as yf
 from earnings_engine import EARNINGS_WINDOW_DAYS, add_earnings_columns, get_upcoming_earnings
 from signal_log import LIVE_STATUSES, append_signals, read_log, summarize_log, update_outcomes
 from llm_engine import GEMINI_MODEL, is_ai_configured, review_breakout_candidates
+from market_conditions import get_market_conditions, summary_line
 from smallcap_screener import (
     BENCHMARK, _ticker_frame, get_candidate_context, get_smallcap_regime, scan_smallcap_breakouts,
 )
 
 
 TOP_N = 10
+BRIEF_N = 3   # setups that get the AI's catalyst and red flags in the morning brief
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 
-def grade_top_setups(results, top_n: int = TOP_N) -> str:
-    """Add the AI reviewer's grade and risk level to the top setups (in place); return a one-line note."""
+def grade_top_setups(results, top_n: int = TOP_N, market_note: str = "") -> tuple:
+    """Add the AI reviewer's grade and risk level to the top setups (in place).
+
+    Returns (one-line note, {ticker: review}) so the morning brief can quote the reviews.
+    """
     if results is None or results.empty:
-        return ""
+        return "", {}
     if not is_ai_configured():
-        return "AI grading skipped: GEMINI_API_KEY is not set."
+        return "AI grading skipped: GEMINI_API_KEY is not set.", {}
     candidates = results.head(top_n).to_dict("records")
     contexts = {candidate["Ticker"]: get_candidate_context(candidate["Ticker"]) for candidate in candidates}
-    outcome = review_breakout_candidates(candidates, contexts)
+    outcome = review_breakout_candidates(candidates, contexts, market_note=market_note)
     if outcome["error"]:
-        return f"AI grading failed, setups are logged ungraded: {outcome['error']}"
+        return f"AI grading failed, setups are logged ungraded: {outcome['error']}", {}
     reviews = outcome["reviews"]
     results["AI Grade"] = [reviews.get(ticker, {}).get("grade", "") for ticker in results["Ticker"]]
     results["AI Risk"] = [reviews.get(ticker, {}).get("risk_level", "") for ticker in results["Ticker"]]
-    return f"AI graded {len(reviews)} of the top {len(candidates)} setups ({GEMINI_MODEL})."
+    return f"AI graded {len(reviews)} of the top {len(candidates)} setups ({GEMINI_MODEL}).", reviews
 
 
-def build_report(results, regime: dict, earnings_note: str, top_n: int = TOP_N, ai_note: str = "") -> tuple:
+def build_brief(results, reviews: dict, brief_n: int = BRIEF_N) -> str:
+    """Telegram HTML with the AI's catalyst, thesis and red flags for the top graded setups; empty without reviews."""
+    if results is None or results.empty or not reviews:
+        return ""
+    lines = ["<b>AI brief</b>"]
+    for ticker in [ticker for ticker in results["Ticker"] if ticker in reviews][:brief_n]:
+        review = reviews[ticker]
+        lines.append(
+            f"\n<b>{escape(ticker)}</b> grade {escape(review['grade'])}, {escape(review['risk_level'].lower())} risk. "
+            f"Catalyst: {escape(review['catalyst'])}"
+        )
+        if review.get("thesis"):
+            lines.append(escape(review["thesis"]))
+        if review.get("red_flags"):
+            lines.append("Red flags: " + escape("; ".join(review["red_flags"])))
+    return "\n".join(lines)
+
+
+def build_report(results, regime: dict, earnings_note: str, top_n: int = TOP_N, ai_note: str = "", market_note: str = "") -> tuple:
     """Return (markdown, telegram_html) for the top setups."""
-    regime_line = f"Small-cap trend (IWM): {regime.get('label', 'Unknown')}"
+    regime_line = market_note or f"Small-cap trend (IWM): {regime.get('label', 'Unknown')}"
     source = results.attrs.get("universe_source", "N/A")
     header = (
         f"{len(results)} setups from {results.attrs.get('analyzed', 'N/A')} stocks ({source}), "
@@ -150,8 +174,14 @@ def main(argv=None) -> int:
     except Exception as error:
         earnings_note = f"Earnings dates unavailable, nothing left out: {error}"
 
-    ai_note = grade_top_setups(results)
-    markdown, html = build_report(results, regime, earnings_note, ai_note=ai_note)
+    try:
+        market_note = summary_line(get_market_conditions())
+    except Exception as error:
+        market_note = ""
+        print(f"Market conditions unavailable: {error}")
+    ai_note, reviews = grade_top_setups(results, market_note=market_note)
+    markdown, html = build_report(results, regime, earnings_note, ai_note=ai_note, market_note=market_note)
+    brief = build_brief(results, reviews)
     log_error = None
     if args.log:
         try:
@@ -169,6 +199,8 @@ def main(argv=None) -> int:
     token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if token and chat_id:
         send_telegram(token, chat_id, html)
+        if brief:
+            send_telegram(token, chat_id, brief)
         print("Sent to Telegram.")
     else:
         print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; results are in the job summary only.")

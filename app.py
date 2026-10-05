@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 from html import escape
 import plotly.graph_objects as go
+import yfinance as yf
 from plotly.subplots import make_subplots
 
 from technical_engine import (
@@ -13,7 +14,11 @@ from technical_engine import (
 )
 from news_engine import get_ticker_news_sentiment
 from index_filter import get_macro_market_trend
-from llm_engine import is_ai_configured, review_breakout_candidates, review_trade_setup
+from llm_engine import ask_follow_up, is_ai_configured, review_breakout_candidates, review_trade_setup
+from market_conditions import RISK_OFF_SIZE, events_soon, get_market_conditions, summary_line
+from journal import (
+    LONG, SHORT, JournalStore, add_trade, close_trade, mark_positions, open_positions, summarize_journal, update_stop,
+)
 from trade_levels import STOP_ATR, TARGET_R, compute_trade_plans
 from event_engine import get_upcoming_events
 from options_engine import get_options_sentiment
@@ -29,8 +34,9 @@ from earnings_engine import EARNINGS_WINDOW_DAYS, add_earnings_columns, get_upco
 from secrets_config import get_configured_secret
 from signal_log import LOG_URL, OPEN, WAITING, fetch_published_log, summarize_by_grade, summarize_log
 from scheduled_scan import TOP_N as ALERTED_TOP_N
+from breakout_engine import MIN_ATR_PCT, MIN_STOP_PCT
 from smallcap_screener import (
-    get_candidate_context, get_smallcap_universe, scan_smallcap_breakouts,
+    _ticker_frame, get_candidate_context, get_smallcap_universe, scan_smallcap_breakouts,
     get_smallcap_regime, backtest_smallcap_breakouts,
     MIN_MARKET_CAP, MAX_MARKET_CAP, MIN_REWARD_RISK, MIN_DOLLAR_VOLUME,
 )
@@ -64,6 +70,8 @@ if "scanner_reviews" not in st.session_state:
     st.session_state.scanner_reviews = {}
 if "scanner_review_error" not in st.session_state:
     st.session_state.scanner_review_error = None
+if "llm_chat" not in st.session_state:
+    st.session_state.llm_chat = []
 
 
 # Helper to prevent Streamlit from treating dollar signs in AI text as LaTeX
@@ -86,12 +94,74 @@ CHART_AMBER = "#F59E0B"
 DASHBOARD_TAB = "Dashboard"
 SCANNER_TAB = "Breakout Scanner"
 TRACK_RECORD_TAB = "Track Record"
+JOURNAL_TAB = "Journal"
+
+
+def market_note_or_empty() -> str:
+    try:
+        return summary_line(get_market_conditions())
+    except Exception as error:
+        print(f"Market conditions unavailable: {error}")
+        return ""
+
+
+def render_market_panel(conditions: dict) -> None:
+    """Market label with its inputs and the macro releases coming up."""
+    reasons = ", ".join(conditions["reasons"])
+    if conditions["label"] == "Risk-on":
+        st.success(f"**Market: Risk-on.** Breakouts have the market behind them. {reasons}.")
+    elif conditions["label"] == "Risk-off":
+        st.error(
+            f"**Market: Risk-off.** Most breakouts fail in this kind of market, so suggested position sizes are cut to "
+            f"{RISK_OFF_SIZE:.0%}. {reasons}."
+        )
+    else:
+        st.warning(f"**Market: Neutral.** Be selective and keep size modest. {reasons}.")
+    iwm, spy = conditions["iwm"], conditions["spy"]
+    m1, m2, m3, m4 = st.columns(4)
+    for column, name, regime in ((m1, "IWM", iwm), (m2, "SPY", spy)):
+        column.metric(
+            f"{name} trend", regime["label"],
+            help=(f"{regime['price']} vs 50-day {regime['sma_50']} ({'rising' if regime['sma_50_rising'] else 'falling'}) "
+                  f"and 200-day {regime['sma_200']}") if regime["label"] != "Unknown" else "History unavailable",
+        )
+    m3.metric("Breadth", f"{conditions['breadth']:.0f}%" if conditions["breadth"] is not None else "N/A",
+              help="Share of the market-movers universe (large caps) above its 50-day average.")
+    m4.metric("VIX", conditions["vix"] if conditions["vix"] is not None else "N/A",
+              delta=f"{conditions['vix_change_5d']:+.2f} in 5 days" if conditions["vix_change_5d"] is not None else None,
+              delta_color="inverse")
+    soon = {(event["date"], event["event"]) for event in events_soon(conditions["events"])}
+    if conditions["events"]:
+        st.markdown("**Macro calendar, next two weeks:** " + " | ".join(
+            (f"**{event['event']} {event['date']}**" if (event["date"], event["event"]) in soon else f"{event['event']} {event['date']}")
+            for event in conditions["events"]
+        ))
+        if soon:
+            st.caption("Bold releases are within two days: a breakout bought now rides on the number.")
+    else:
+        st.caption("No major US releases in the next two weeks.")
+    st.caption(f"Calendar: {conditions['events_source']}." + (f" Price data error: {conditions['error']}" if conditions["error"] else ""))
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_signal_log():
     """The forward signal log the scheduled scan publishes on the signal-log branch."""
     return fetch_published_log(get_configured_secret("SIGNAL_LOG_URL") or LOG_URL)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def latest_closes(tickers: tuple) -> dict:
+    """Last price per ticker from daily bars (today's bar moves with the market during the session)."""
+    if not tickers:
+        return {}
+    batch = yf.download(tickers=list(tickers), period="5d", interval="1d", group_by="ticker", auto_adjust=False, progress=False)
+    prices = {}
+    for ticker in tickers:
+        frame = _ticker_frame(batch, ticker)
+        close = pd.to_numeric(frame["Close"], errors="coerce").dropna() if "Close" in frame else pd.Series(dtype=float)
+        if not close.empty:
+            prices[ticker] = float(close.iloc[-1])
+    return prices
 
 
 def load_scanner_ticker():
@@ -188,11 +258,13 @@ if refresh_data:
     get_candidate_context.clear()
     get_smallcap_regime.clear()
     get_upcoming_earnings.clear()
+    get_market_conditions.clear()
     st.rerun()
 
 # Reset analysis state if user changes the ticker
 if selected_ticker != st.session_state.last_analyzed_ticker:
     st.session_state.llm_analysis = None
+    st.session_state.llm_chat = []
     st.session_state.last_analyzed_ticker = selected_ticker
 
 # Load Chart, Sentiment, Macro Trend & Upcoming Events Data
@@ -234,8 +306,8 @@ st.markdown(
 )
 
 
-dashboard_tab, scanner_tab, track_tab = st.tabs(
-    [DASHBOARD_TAB, SCANNER_TAB, TRACK_RECORD_TAB], key="main_view", on_change="rerun"
+dashboard_tab, scanner_tab, track_tab, journal_tab = st.tabs(
+    [DASHBOARD_TAB, SCANNER_TAB, TRACK_RECORD_TAB, JOURNAL_TAB], key="main_view", on_change="rerun"
 )
 
 # Only the open tab runs, so working in the scanner doesn't reload the dashboard's data (and vice versa)
@@ -249,7 +321,9 @@ with scanner_tab:
             st.caption(
                 f"US stocks with a {MIN_MARKET_CAP / 1e6:,.0f}M-{MAX_MARKET_CAP / 1e9:,.0f}B USD market cap and at least "
                 f"{MIN_DOLLAR_VOLUME / 1e6:,.0f}M USD average daily dollar volume, in a 3-8 week base within 8% of the pivot, "
-                f"above the 50-day average, with a measured-move reward/risk of {MIN_REWARD_RISK:.0f}:1 or better."
+                f"above the 50-day average, with a measured-move reward/risk of {MIN_REWARD_RISK:.0f}:1 or better. "
+                f"Stops sit at least 1 ATR and {MIN_STOP_PCT:.0%} under the pivot, and stocks moving less than "
+                f"{MIN_ATR_PCT:.1%} a day (usually pinned by a pending takeover) are left out."
             )
         with scan_btn_col:
             if st.button("Run Breakout Scan", width="stretch"):
@@ -263,23 +337,10 @@ with scanner_tab:
                 st.session_state.scanner_reviews = {}
                 st.session_state.scanner_review_error = None
 
-        regime = get_smallcap_regime()
-        regime_detail = (
-            f"IWM {regime['price']:.2f} | 50-day {regime['sma_50']:.2f} ({'rising' if regime['sma_50_rising'] else 'falling'}) "
-            f"| 200-day {regime['sma_200']:.2f}"
-            if regime["label"] != "Unknown" else "IWM history unavailable"
-        )
-        if regime["label"] == "Uptrend":
-            st.success(f"**Small-cap trend: Uptrend.** Breakouts have the market behind them. {regime_detail}")
-        elif regime["label"] == "Downtrend":
-            st.error(
-                f"**Small-cap trend: Downtrend.** Most breakouts fail in a falling small-cap market; "
-                f"consider smaller size or waiting. {regime_detail}"
-            )
-        elif regime["label"] == "Mixed":
-            st.warning(f"**Small-cap trend: Mixed.** Be selective and keep size modest. {regime_detail}")
-        else:
-            st.caption(f"Small-cap trend unavailable: {regime_detail}.")
+        with st.spinner("Checking market conditions..."):
+            market = get_market_conditions()
+        render_market_panel(market)
+        size_factor = RISK_OFF_SIZE if market["label"] == "Risk-off" else 1.0
 
         scan_results = st.session_state.scanner_results
         if scan_results is not None and scan_results.attrs.get("universe_source") == "fallback list":
@@ -336,7 +397,7 @@ with scanner_tab:
                     lambda value: value / 1e6 if isinstance(value, (int, float)) else None
                 )
                 sizes = [
-                    position_size(account_size, risk_pct, row["Pivot"], row["Stop"])
+                    position_size(account_size, risk_pct * size_factor, row["Pivot"], row["Stop"])
                     for _, row in scan_view.iterrows()
                 ]
                 display_df["Shares"] = [size["shares"] if size else None for size in sizes]
@@ -364,7 +425,7 @@ with scanner_tab:
                         "Breakout Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
                         "Shares": st.column_config.NumberColumn(
                             "Shares", format="%d",
-                            help=f"Buy-stop at the pivot, sized to risk {risk_pct:.2f}% of a {account_size:,.0f} USD account.",
+                            help=f"Buy-stop at the pivot, sized to risk {risk_pct * size_factor:.2f}% of a {account_size:,.0f} USD account.",
                         ),
                         "Position": st.column_config.NumberColumn("Position", format="$%.0f"),
                         "Earnings": st.column_config.TextColumn("Earnings"),
@@ -372,8 +433,9 @@ with scanner_tab:
                     },
                 )
                 st.caption(
-                    f"Shares risk {risk_pct:.2f}% of a {account_size:,.0f} USD account from pivot to stop "
-                    "(change it under Position Sizing in the sidebar)."
+                    f"Shares risk {risk_pct * size_factor:.2f}% of a {account_size:,.0f} USD account from pivot to stop "
+                    + (f"(your {risk_pct:.2f}% cut to {RISK_OFF_SIZE:.0%} in a Risk-off market; " if size_factor < 1 else "(")
+                    + "change it under Position Sizing in the sidebar)."
                 )
 
                 review_count = min(8, len(scan_view))
@@ -395,7 +457,7 @@ with scanner_tab:
                     with st.spinner("Collecting float, short interest and headlines for the top candidates..."):
                         contexts = {c["Ticker"]: get_candidate_context(c["Ticker"]) for c in candidates}
                     with st.spinner("Running AI review..."):
-                        review_result = review_breakout_candidates(candidates, contexts)
+                        review_result = review_breakout_candidates(candidates, contexts, market_note=summary_line(market))
                     st.session_state.scanner_reviews = review_result["reviews"]
                     st.session_state.scanner_review_error = review_result["error"]
                     st.rerun()
@@ -754,6 +816,9 @@ with dashboard_tab:
                 "Plan the exit before the report and expect IV expansion followed by IV crush."
             )
 
+        if st.toggle("Show market conditions and macro calendar", key="show_market_panel"):
+            render_market_panel(get_market_conditions())
+
         with st.expander("Recent Catalyst Headlines", expanded=False):
             if event_data.get("news_headlines"):
                 for headline in event_data["news_headlines"]:
@@ -808,6 +873,7 @@ with dashboard_tab:
                 intraday_metrics = get_intraday_metrics(selected_ticker)
                 scanner_context = get_candidate_context(selected_ticker) if scanner_row else None
                 levels = compute_trade_plans(latest_price, df_1d, analysis_mode, scanner_row)
+                market_note = market_note_or_empty()
 
             with st.spinner("Running AI review..."):
                 result = review_trade_setup(
@@ -825,8 +891,20 @@ with dashboard_tab:
                     intraday_metrics=intraday_metrics,
                     scanner_row=scanner_row,
                     scanner_context=scanner_context,
+                    market_note=market_note,
                 )
             st.session_state.llm_analysis = {**result, "levels": levels, "price": latest_price, "mode": analysis_mode}
+            st.session_state.llm_chat = []
+
+        def ask_follow_up_callback():
+            question = st.session_state.get("follow_up_question", "").strip()
+            analysis = st.session_state.llm_analysis
+            if not question or not analysis or not analysis.get("review"):
+                return
+            with st.spinner("Asking the AI..."):
+                answer = ask_follow_up(analysis["prompt"], analysis["review"], st.session_state.llm_chat, question)
+            st.session_state.llm_chat.append({"question": question, "answer": answer["answer"], "error": answer["error"]})
+            st.session_state.follow_up_question = ""
 
         # Section: AI Trade Review
         st.markdown('<div id="ai-analysis"></div>', unsafe_allow_html=True)
@@ -915,6 +993,23 @@ with dashboard_tab:
                     st.markdown(
                         "\n".join(f"- {sanitize_ai_text(item)}" for item in items) if items else "Nothing noted."
                     )
+
+            st.markdown("**Ask a follow-up**")
+            for turn in st.session_state.llm_chat:
+                st.markdown(f"**You:** {sanitize_ai_text(turn['question'])}")
+                if turn["error"]:
+                    st.error(f"No answer: {turn['error']}")
+                else:
+                    st.markdown(f"**AI:** {sanitize_ai_text(turn['answer'])}")
+            q_col, a_col = st.columns([4, 1], vertical_alignment="bottom")
+            with q_col:
+                st.text_input(
+                    "Question about this review", key="follow_up_question",
+                    placeholder="e.g. Why not wait for a retest of the pivot?", label_visibility="collapsed",
+                )
+            with a_col:
+                st.button("Ask", on_click=ask_follow_up_callback, width="stretch", key="ask_follow_up")
+            st.caption("The AI answers from the same data and review as above; nothing new is downloaded.")
         else:
             st.info("Click 'Run AI Review' to have the AI grade a trade plan for this ticker.")
 
@@ -1004,4 +1099,145 @@ with track_tab:
             st.caption(
                 f"{OPEN} trades show their mark at the latest close; {WAITING} signals haven't traded through the pivot yet. "
                 "Screening output is informational, not investment advice."
+            )
+
+with journal_tab:
+    if journal_tab.open:
+        st.subheader("Trade Journal")
+        store = JournalStore()
+        if "journal" not in st.session_state or st.button("Reload journal", key="reload_journal"):
+            try:
+                st.session_state.journal = store.load()
+                st.session_state.journal_sha = store.sha
+                st.session_state.journal_error = None
+            except Exception as error:
+                st.session_state.journal = None
+                st.session_state.journal_error = str(error)
+        store.sha = st.session_state.get("journal_sha")
+        journal = st.session_state.journal
+        st.caption(
+            f"The trades you actually take, {store.description}. Open positions get a Telegram alert during market "
+            "hours when they reach their stop or target, and the evening recap lists them."
+        )
+        if not store.remote:
+            st.warning(
+                "The journal is in a local file, which a hosted app loses when it restarts. Add a GITHUB_JOURNAL_TOKEN "
+                "secret (a fine-grained GitHub token with read and write access to this repository's contents) to keep it "
+                "on GitHub, where the alerts can see it."
+            )
+        if journal is None:
+            st.error(f"Journal unavailable: {st.session_state.journal_error}")
+            st.stop()
+
+        def save(updated, message):
+            try:
+                store.save(updated, message)
+                st.session_state.journal = updated
+                st.session_state.journal_sha = store.sha
+                return True
+            except Exception as error:
+                st.error(f"Not saved: {error}")
+                return False
+
+        positions = open_positions(journal)
+        summary = summarize_journal(journal)
+        prices = latest_closes(tuple(sorted(set(positions["Ticker"])))) if not positions.empty else {}
+        marked = mark_positions(positions, prices) if not positions.empty else pd.DataFrame()
+        open_pnl = pd.to_numeric(marked["P&L"], errors="coerce").sum() if not marked.empty else 0.0
+
+        j1, j2, j3, j4 = st.columns(4)
+        j1.metric("Open Positions", summary["open"])
+        j2.metric("Open P&L", f"{open_pnl:+,.0f}", help="USD, at the latest prices.")
+        j3.metric("Realized P&L", f"{summary['total_pnl']:+,.0f}", help="USD, from closed trades.",
+                  delta=f"{summary['average_r']:+.2f}R average" if summary["average_r"] is not None else None)
+        j4.metric("Win Rate", f"{summary['win_rate_pct']:.0f}%" if summary["win_rate_pct"] is not None else "N/A",
+                  help=f"{summary['closed']} closed trades.")
+
+        st.markdown("**Open positions**")
+        if marked.empty:
+            st.info("No open positions. Add a trade below when you take one.")
+        else:
+            st.dataframe(
+                marked, hide_index=True, width="stretch",
+                column_config={
+                    "Entry": st.column_config.NumberColumn("Entry", format="$%.2f"),
+                    "Shares": st.column_config.NumberColumn("Shares", format="%g"),
+                    "Stop": st.column_config.NumberColumn("Stop", format="$%.2f"),
+                    "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
+                    "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                    "P&L": st.column_config.NumberColumn("P&L", format="$%+.0f"),
+                    "R": st.column_config.NumberColumn("R", format="%+.2f"),
+                    "To Stop %": st.column_config.NumberColumn("To Stop", format="%.1f%%"),
+                    "To Target %": st.column_config.NumberColumn("To Target", format="%.1f%%"),
+                },
+            )
+            st.caption("Prices are the latest daily bar, refreshed every minute; R is measured from the stop the trade was opened with.")
+
+            labels = {f"{row['Ticker']} {row['Side'].lower()} from {float(row['Entry']):.2f} ({row['ID']})": row["ID"]
+                      for _, row in positions.iterrows()}
+            st.markdown("**Close a trade or move its stop**")
+            chosen = st.selectbox("Trade", list(labels), key="manage_trade_choice")
+            trade = positions[positions["ID"] == labels[chosen]].iloc[0]
+            with st.form(f"manage_trade_{labels[chosen]}"):
+                c1, c2, c3 = st.columns(3)
+                exit_price = c1.number_input("Exit price", min_value=0.0, value=float(prices.get(trade["Ticker"], trade["Entry"])), step=0.01, format="%.2f")
+                exit_date = c2.date_input("Exit date", value=pd.Timestamp.today())
+                reason = c3.selectbox("Reason", ["Target", "Stop", "Manual exit", "Time exit"])
+                new_stop = st.number_input("New stop", min_value=0.0, value=float(trade["Stop"]), step=0.01, format="%.2f")
+                close_col, stop_col = st.columns(2)
+                do_close = close_col.form_submit_button("Close trade", width="stretch")
+                do_stop = stop_col.form_submit_button("Move stop", width="stretch")
+            if do_close:
+                if save(close_trade(journal, labels[chosen], exit_price, exit_date, reason), f"Journal: close {trade['Ticker']}"):
+                    st.rerun()
+            if do_stop:
+                if save(update_stop(journal, labels[chosen], new_stop), f"Journal: move {trade['Ticker']} stop to {new_stop:.2f}"):
+                    st.rerun()
+
+        with st.expander("Add a trade", expanded=positions.empty):
+            journal_scan = st.session_state.scanner_results
+            prefill = None
+            if journal_scan is not None and not journal_scan.empty and selected_ticker in set(journal_scan["Ticker"]):
+                prefill = journal_scan.loc[journal_scan["Ticker"] == selected_ticker].iloc[0]
+            if prefill is not None:
+                st.caption(f"Prefilled from the scanner's {selected_ticker} setup: entry at the pivot, its stop and target.")
+            with st.form("add_trade", clear_on_submit=True):
+                a1, a2, a3 = st.columns(3)
+                ticker_in = a1.text_input("Ticker", value=selected_ticker)
+                side_in = a2.selectbox("Side", [LONG, SHORT])
+                date_in = a3.date_input("Entry date", value=pd.Timestamp.today())
+                b1, b2, b3, b4 = st.columns(4)
+                entry_in = b1.number_input("Entry", min_value=0.0, value=float(prefill["Pivot"]) if prefill is not None else 0.0, step=0.01, format="%.2f")
+                stop_in = b2.number_input("Stop", min_value=0.0, value=float(prefill["Stop"]) if prefill is not None else 0.0, step=0.01, format="%.2f")
+                target_in = b3.number_input("Target (optional)", min_value=0.0, value=float(prefill["Target"]) if prefill is not None else 0.0, step=0.01, format="%.2f")
+                suggested = position_size(account_size, risk_pct, float(prefill["Pivot"]), float(prefill["Stop"])) if prefill is not None else None
+                shares_in = b4.number_input("Shares", min_value=0.0, value=float(suggested["shares"]) if suggested else 0.0, step=1.0)
+                setup_in = st.text_input("Setup", value="Breakout scanner" if prefill is not None else "")
+                notes_in = st.text_input("Notes")
+                submitted = st.form_submit_button("Add trade")
+            if submitted:
+                try:
+                    updated = add_trade(journal, ticker_in, side_in, date_in, entry_in, shares_in, stop_in,
+                                        target_in or None, setup_in, notes_in)
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    if save(updated, f"Journal: add {ticker_in.strip().upper()}"):
+                        st.rerun()
+
+        closed = journal[journal["Status"] == "Closed"] if not journal.empty else journal
+        if not closed.empty:
+            st.markdown("**Closed trades**")
+            st.dataframe(
+                closed.sort_values("Exit Date", ascending=False).drop(columns=["ID", "Status"]),
+                hide_index=True, width="stretch",
+                column_config={
+                    "Entry": st.column_config.NumberColumn("Entry", format="$%.2f"),
+                    "Exit": st.column_config.NumberColumn("Exit", format="$%.2f"),
+                    "Stop": st.column_config.NumberColumn("Stop", format="$%.2f"),
+                    "Initial Stop": st.column_config.NumberColumn("Initial Stop", format="$%.2f"),
+                    "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
+                    "P&L": st.column_config.NumberColumn("P&L", format="$%+.0f"),
+                    "R": st.column_config.NumberColumn("R", format="%+.2f"),
+                },
             )
