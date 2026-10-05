@@ -2,8 +2,9 @@ name: Scheduled breakout scan
 
 on:
   schedule:
-    # 13:00 UTC on weekdays: 9:00 New York in summer, 8:00 in winter, before the open
-    - cron: "0 13 * * 1-5"
+    # 12:41 UTC on weekdays: 8:41 New York in summer, 7:41 in winter, before the open. Off the top of
+    # the hour on purpose: GitHub delays or drops scheduled runs most often at :00.
+    - cron: "41 12 * * 1-5"
   workflow_dispatch:
 
 # The scan commits the signal log, so two runs must not race each other's push.

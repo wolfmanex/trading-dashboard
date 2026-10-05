@@ -2,9 +2,10 @@ name: Intraday breakout alerts
 
 on:
   schedule:
-    # Every 15 minutes, 13:00-20:45 UTC on weekdays. That covers 9:30-16:00 New York in both summer
-    # and winter time; the script itself skips runs outside 9:45-16:00. GitHub can delay scheduled runs.
-    - cron: "*/15 13-20 * * 1-5"
+    # Every 15 minutes, 13:07-20:52 UTC on weekdays. That covers 9:30-16:00 New York in both summer
+    # and winter time; the script itself skips runs outside 9:45-16:00. The odd minutes avoid the
+    # top-of-the-hour load on GitHub, when scheduled runs are most often delayed or dropped.
+    - cron: "7,22,37,52 13-20 * * 1-5"
   workflow_dispatch:
 
 concurrency: intraday-alerts
