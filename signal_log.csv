@@ -1,5 +1,5 @@
 Scan Date,Ticker,Rank,Price,Pivot,Stop,Target,Reward/Risk,Breakout Score,IWM Trend,Universe,Status,Entry Date,Entry,Exit Date,Exit,R,Return %,IWM %,AI Grade,AI Risk,Updated
 2026-10-05,WEAV,1,7.36,7.4,7.33,9.57,30.93,92.4,Mixed,Yahoo screener,Waiting,,,,,,,,B,MEDIUM,2026-10-06
-2026-10-05,UTZ,2,14.27,14.27,14.21,14.56,4.87,91.4,Mixed,Yahoo screener,Open,2026-10-05,14.29,2026-10-05,14.28,-0.13,-0.07,0.66,B,LOW,2026-10-06
+2026-10-05,UTZ,2,14.27,14.27,14.21,14.56,4.87,91.4,Mixed,Yahoo screener,Open,2026-10-05,14.29,2026-10-06,14.28,-0.13,-0.07,-0.05,B,LOW,2026-10-06
 2026-10-05,PRTH,3,7.78,7.84,7.64,9.93,10.48,69.8,Mixed,Yahoo screener,Waiting,,,,,,,,C,HIGH,2026-10-06
-2026-10-05,NVAX,4,10.33,11.11,10.15,14.38,3.41,60.8,Mixed,Yahoo screener,Open,2026-10-05,11.11,2026-10-05,12.56,1.51,13.05,0.66,C,HIGH,2026-10-06
+2026-10-05,NVAX,4,10.33,11.11,10.15,14.38,3.41,60.8,Mixed,Yahoo screener,Open,2026-10-05,11.11,2026-10-06,11.32,0.22,1.89,-0.05,C,HIGH,2026-10-06
