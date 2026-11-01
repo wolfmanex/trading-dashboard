@@ -17,7 +17,8 @@ from breakout_backtest import ENTRY_WINDOW, simulate_trade, summarize_trades
 
 LOG_BRANCH = "signal-log"
 LOG_FILE = "signal_log.csv"
-LOG_URL = f"https://raw.githubusercontent.com/wolfmanex/trading-dashboard/{LOG_BRANCH}/{LOG_FILE}"
+GITHUB_REPO = "wolfmanex/trading-dashboard"
+LOG_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{LOG_BRANCH}/{LOG_FILE}"
 
 LOG_COLUMNS = [
     "Scan Date", "Ticker", "Rank", "Price", "Pivot", "Stop", "Target", "Reward/Risk", "Breakout Score",
@@ -49,13 +50,31 @@ def read_log(source) -> pd.DataFrame:
     return log[LOG_COLUMNS]
 
 
-def fetch_published_log(url: str = LOG_URL, timeout: int = 15) -> pd.DataFrame:
-    """Download the log the scheduled scan publishes; a 404 (nothing logged yet) gives an empty log."""
-    response = requests.get(url, timeout=timeout)
+def fetch_branch_file(url: str, file: str, token: str = None, timeout: int = 15) -> str | None:
+    """Text of a file the workflows publish on the signal-log branch, or None when it doesn't exist yet.
+
+    With a GitHub token it is read through the contents API, which works while the repo is private;
+    without one it falls back to the public raw URL (a private repo answers that with 404).
+    """
+    if token:
+        response = requests.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file}",
+            params={"ref": LOG_BRANCH},
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.raw+json"},
+            timeout=timeout,
+        )
+    else:
+        response = requests.get(url, timeout=timeout)
     if response.status_code == 404:
-        return empty_log()
+        return None
     response.raise_for_status()
-    return read_log(io.StringIO(response.text))
+    return response.text
+
+
+def fetch_published_log(url: str = LOG_URL, timeout: int = 15, token: str = None) -> pd.DataFrame:
+    """Download the log the scheduled scan publishes; a 404 (nothing logged yet) gives an empty log."""
+    text = fetch_branch_file(url, LOG_FILE, token=token, timeout=timeout)
+    return empty_log() if text is None else read_log(io.StringIO(text))
 
 
 def append_signals(log: pd.DataFrame, results: pd.DataFrame, scan_date: date, iwm_trend: str = "") -> pd.DataFrame:

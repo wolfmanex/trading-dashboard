@@ -16,11 +16,10 @@ from html import escape
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import requests
 
 from daytrade_engine import BREAKING_OUT, evaluate_daytrade, split_sessions
 from market_calendar import is_trading_day
-from signal_log import LOG_BRANCH
+from signal_log import GITHUB_REPO, LOG_BRANCH, fetch_branch_file
 from smallcap_screener import _ticker_frame
 
 
@@ -36,7 +35,7 @@ DAYTRADE_COLUMNS = [
 
 
 DAYTRADE_FILE = "daytrade_alerts.csv"
-DAYTRADE_LOG_URL = f"https://raw.githubusercontent.com/wolfmanex/trading-dashboard/{LOG_BRANCH}/{DAYTRADE_FILE}"
+DAYTRADE_LOG_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{LOG_BRANCH}/{DAYTRADE_FILE}"
 
 
 def in_alert_window(now: datetime) -> bool:
@@ -51,13 +50,10 @@ def read_alerts(path) -> pd.DataFrame:
     return alerts.reindex(columns=DAYTRADE_COLUMNS)
 
 
-def fetch_published_alerts(url: str = DAYTRADE_LOG_URL, timeout: int = 15) -> pd.DataFrame:
+def fetch_published_alerts(url: str = DAYTRADE_LOG_URL, timeout: int = 15, token: str = None) -> pd.DataFrame:
     """The alerts the market session publishes on the signal-log branch; a 404 (none sent yet) is empty."""
-    response = requests.get(url, timeout=timeout)
-    if response.status_code == 404:
-        return pd.DataFrame(columns=DAYTRADE_COLUMNS)
-    response.raise_for_status()
-    return read_alerts(io.StringIO(response.text))
+    text = fetch_branch_file(url, DAYTRADE_FILE, token=token, timeout=timeout)
+    return pd.DataFrame(columns=DAYTRADE_COLUMNS) if text is None else read_alerts(io.StringIO(text))
 
 
 def pick_alerts(results: pd.DataFrame, already: set, top_n: int = TOP_N, min_score: float = MIN_SCORE) -> list:
