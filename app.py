@@ -179,7 +179,10 @@ def cached_ta_backtest(df: pd.DataFrame, holding_period: int, cost_per_trade_pct
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_signal_log():
     """The forward signal log the scheduled scan publishes on the signal-log branch."""
-    return fetch_published_log(get_configured_secret("SIGNAL_LOG_URL") or LOG_URL)
+    # The repo is private, so the log is read with the journal's GitHub token (raw URLs answer 404).
+    return fetch_published_log(
+        get_configured_secret("SIGNAL_LOG_URL") or LOG_URL, token=get_configured_secret("GITHUB_JOURNAL_TOKEN"),
+    )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -232,7 +235,9 @@ def match_timeframe_to_horizon():
 @st.cache_data(ttl=900, show_spinner=False)
 def load_daytrade_alerts():
     """The large-cap day-trade alerts the market session publishes on the signal-log branch."""
-    return fetch_published_alerts(get_configured_secret("DAYTRADE_LOG_URL") or DAYTRADE_LOG_URL)
+    return fetch_published_alerts(
+        get_configured_secret("DAYTRADE_LOG_URL") or DAYTRADE_LOG_URL, token=get_configured_secret("GITHUB_JOURNAL_TOKEN"),
+    )
 
 
 st.title("AI Trading Dashboard")
@@ -1279,6 +1284,8 @@ with track_tab:
 
         if signal_log is not None and signal_log.empty:
             st.info("No signals logged yet. The first ones appear after the next scheduled scan (weekdays, before the US open).")
+            if not get_configured_secret("GITHUB_JOURNAL_TOKEN"):
+                st.caption("The repository is private, so the log can only be read with a GITHUB_JOURNAL_TOKEN secret.")
         elif signal_log is not None:
             scope = st.radio(
                 "Signals", [f"Top {ALERTED_TOP_N} (sent as alerts)", "All logged setups"],

@@ -294,5 +294,31 @@ class DayTradeAlertTests(unittest.TestCase):
         self.assertEqual(daytrade_alerts.summarize_daytrades(daytrade_alerts.read_alerts("/nonexistent.csv")), {"trades": 0})
 
 
+class PrivateRepoFetchTests(unittest.TestCase):
+    def response(self, status=200, text=""):
+        response = mock.Mock(status_code=status, text=text)
+        response.raise_for_status.return_value = None
+        return response
+
+    def test_token_reads_through_the_contents_api(self):
+        import signal_log
+        csv = "Date,Time,Ticker,Price\n2026-10-30,10:15,AAA,102.3\n"
+        with mock.patch("requests.get", return_value=self.response(text=csv)) as get:
+            alerts = daytrade_alerts.fetch_published_alerts(token="secret")
+        url = get.call_args.args[0]
+        self.assertEqual(url, f"https://api.github.com/repos/{signal_log.GITHUB_REPO}/contents/daytrade_alerts.csv")
+        self.assertEqual(get.call_args.kwargs["params"], {"ref": "signal-log"})
+        self.assertEqual(get.call_args.kwargs["headers"]["Authorization"], "Bearer secret")
+        self.assertEqual(list(alerts["Ticker"]), ["AAA"])
+
+    def test_without_token_uses_the_raw_url_and_404_is_empty(self):
+        import signal_log
+        with mock.patch("requests.get", return_value=self.response(status=404)) as get:
+            log = signal_log.fetch_published_log()
+        self.assertEqual(get.call_args.args[0], signal_log.LOG_URL)
+        self.assertTrue(log.empty)
+        self.assertEqual(list(log.columns), signal_log.LOG_COLUMNS)
+
+
 if __name__ == "__main__":
     unittest.main()
