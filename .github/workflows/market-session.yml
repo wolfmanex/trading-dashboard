@@ -1,7 +1,8 @@
 name: Market session
 
 # Started by the morning scan once it finishes. Checks the logged setups and the journal's open
-# positions every 15 minutes through the session (intraday_alerts.py), then sends the evening recap.
+# positions every 15 minutes through the session (intraday_alerts.py), scans large caps for day-trade
+# breakouts on the same beat (daytrade_alerts.py), then sends the evening recap.
 # GitHub's cron never fired in this repo, so this runs as one long dispatched session instead of a
 # schedule. A job may run 6 hours at most, so the session is split at 12:30 New York. If the morning job
 # fails early, the midday job holds the afternoon back until 12:30 so it still reaches 16:00 within its
@@ -49,6 +50,7 @@ jobs:
           path: |
             signal-log-data/intraday_alerts.csv
             signal-log-data/position_alerts.csv
+            signal-log-data/daytrade_alerts.csv
           if-no-files-found: ignore
           retention-days: 1
 
@@ -96,7 +98,7 @@ jobs:
           python - <<'EOF'
           import os
           import pandas as pd
-          for name in ["intraday_alerts.csv", "position_alerts.csv"]:
+          for name in ["intraday_alerts.csv", "position_alerts.csv", "daytrade_alerts.csv"]:
               saved, kept = os.path.join("morning-alerts", name), os.path.join("signal-log-data", name)
               if not os.path.exists(saved):
                   continue
@@ -136,11 +138,13 @@ jobs:
           AFTERNOON_CHECKS: ${{ needs.afternoon.outputs.checks }}
         run: >
           python daily_check.py recap --log signal-log-data/signal_log.csv --journal signal-log-data/journal.csv
+          --daytrades signal-log-data/daytrade_alerts.csv
           --checks $(( ${MORNING_CHECKS:-0} + ${AFTERNOON_CHECKS:-0} ))
       - name: Save the signal log
         working-directory: signal-log-data
         run: |
           git add signal_log.csv
+          if [ -f daytrade_alerts.csv ]; then git add daytrade_alerts.csv; fi
           git diff --cached --quiet && exit 0
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
