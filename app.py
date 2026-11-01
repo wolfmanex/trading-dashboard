@@ -37,6 +37,15 @@ from signal_log import (
 )
 from scheduled_scan import TOP_N as ALERTED_TOP_N
 from breakout_engine import MIN_ATR_PCT, MIN_STOP_PCT
+from daytrade_engine import MAX_BELOW_TRIGGER, MAX_EXTENSION, MAX_RISK_PCT, MIN_RISK_PCT, MIN_RVOL, TARGET_R
+from daytrade_alerts import (
+    DAYTRADE_LOG_URL, FIRST_ALERT as DAYTRADE_FIRST_ALERT, LAST_ALERT as DAYTRADE_LAST_ALERT, MIN_SCORE as DAYTRADE_MIN_SCORE,
+    TOP_N as DAYTRADE_TOP_N, fetch_published_alerts, summarize_daytrades,
+)
+from largecap_scanner import (
+    MAX_UNIVERSE as LARGECAP_UNIVERSE, MIN_DOLLAR_VOLUME as LARGECAP_MIN_DOLLAR_VOLUME,
+    MIN_MARKET_CAP as LARGECAP_MIN_MARKET_CAP, cached_scan_daytrade_setups, get_largecap_universe,
+)
 from smallcap_screener import (
     _ticker_frame, get_candidate_context, get_smallcap_universe, scan_smallcap_breakouts,
     get_smallcap_regime, backtest_smallcap_breakouts,
@@ -75,6 +84,8 @@ if "scanner_review_error" not in st.session_state:
     st.session_state.scanner_review_error = None
 if "llm_chat" not in st.session_state:
     st.session_state.llm_chat = []
+if "daytrade_results" not in st.session_state:
+    st.session_state.daytrade_results = None
 
 
 # Helper to prevent Streamlit from treating dollar signs in AI text as LaTeX
@@ -104,6 +115,10 @@ CHART_BLUE = "#1F3DFF"
 CHART_AMBER = "#F59E0B"
 
 DASHBOARD_TAB = "Dashboard"
+SWING_MODE = "Weekly (Swing/Position)"
+INTRADAY_MODE = "Intra-Day (Scalp/Day Trade)"
+SMALLCAP_SCANNER = "Small-cap swing breakouts"
+DAYTRADE_SCANNER = "Large-cap day-trade breakouts"
 SCANNER_TAB = "Breakout Scanner"
 TRACK_RECORD_TAB = "Track Record"
 JOURNAL_TAB = "Journal"
@@ -192,6 +207,32 @@ def load_scanner_ticker():
         st.session_state.custom_ticker = tickers[rows[0]]
         st.session_state.custom_ticker_value = tickers[rows[0]]
         st.session_state.main_view = DASHBOARD_TAB
+        st.session_state.chart_levels_source = SMALLCAP_SCANNER
+
+
+def load_daytrade_ticker():
+    """Open the clicked day-trade setup on the dashboard's 5-minute chart with its trigger, stop and target."""
+    selection = st.session_state.get("daytrade_table")
+    rows = selection.selection.rows if selection else []
+    tickers = st.session_state.get("daytrade_display_tickers", [])
+    if rows and rows[0] < len(tickers):
+        st.session_state.ticker_mode = "Custom Input"
+        st.session_state.custom_ticker = tickers[rows[0]]
+        st.session_state.custom_ticker_value = tickers[rows[0]]
+        st.session_state.analysis_mode = INTRADAY_MODE
+        st.session_state.timeframe = "5m"
+        st.session_state.main_view = DASHBOARD_TAB
+        st.session_state.chart_levels_source = DAYTRADE_SCANNER
+
+
+def match_timeframe_to_horizon():
+    st.session_state.timeframe = "5m" if st.session_state.analysis_mode == INTRADAY_MODE else "1d"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_daytrade_alerts():
+    """The large-cap day-trade alerts the market session publishes on the signal-log branch."""
+    return fetch_published_alerts(get_configured_secret("DAYTRADE_LOG_URL") or DAYTRADE_LOG_URL)
 
 
 st.title("AI Trading Dashboard")
@@ -237,18 +278,17 @@ with st.sidebar.expander("Asset", expanded=True):
     if ",".join(watchlist_selection) != st.query_params.get("watchlist", ""):
         st.query_params["watchlist"] = ",".join(watchlist_selection)
 
+if "analysis_mode" not in st.session_state:
+    st.session_state.analysis_mode = SWING_MODE
+if "timeframe" not in st.session_state:
+    st.session_state.timeframe = "1d"
+
 with st.sidebar.expander("Strategy", expanded=True):
+    # Switching the horizon picks its usual timeframe (5m intraday, 1d swing); the timeframe can still be changed.
     analysis_mode = st.radio(
-        "Horizon",
-        ["Weekly (Swing/Position)", "Intra-Day (Scalp/Day Trade)"],
-        index=0,
+        "Horizon", [SWING_MODE, INTRADAY_MODE], key="analysis_mode", on_change=match_timeframe_to_horizon,
     )
-    default_tf_index = 0 if "Intra-Day" in analysis_mode else 3
-    timeframe = st.selectbox(
-        "Chart Timeframe",
-        ["5m", "15m", "1h", "1d", "1w"],
-        index=default_tf_index,
-    )
+    timeframe = st.selectbox("Chart Timeframe", ["5m", "15m", "1h", "1d", "1w"], key="timeframe")
 
 with st.sidebar.expander("Backtest", expanded=False):
     backtest_holding_period = st.number_input(
@@ -283,6 +323,9 @@ if refresh_data:
     get_live_price.clear()
     get_smallcap_universe.clear()
     scan_smallcap_breakouts.clear()
+    get_largecap_universe.clear()
+    cached_scan_daytrade_setups.clear()
+    load_daytrade_alerts.clear()
     get_candidate_context.clear()
     get_smallcap_regime.clear()
     get_upcoming_earnings.clear()
@@ -345,6 +388,113 @@ st.markdown(
 )
 
 
+def render_daytrade_scanner() -> None:
+    """Scanner tab, large-cap day-trade mode: run the intraday scan and list the setups."""
+    title_col, button_col = st.columns([3, 1])
+    with title_col:
+        st.subheader("Large-Cap Day-Trade Breakout Scanner")
+        st.caption(
+            f"The {LARGECAP_UNIVERSE} most traded US stocks above {LARGECAP_MIN_MARKET_CAP / 1e9:,.0f}B USD market cap with "
+            f"at least {LARGECAP_MIN_DOLLAR_VOLUME / 1e6:,.0f}M USD traded a day, on 5-minute bars. The trigger is the "
+            f"15-minute opening-range high (the pre-market high before the open). Listed: within "
+            f"{MAX_BELOW_TRIGGER:.1%} under the trigger or up to {MAX_EXTENSION:.0%} through it, above VWAP, on at least "
+            f"{MIN_RVOL:.1f}x the usual volume for this time of day. Stops sit under the tighter of the opening-range "
+            f"low and VWAP, {MIN_RISK_PCT:.1%}-{MAX_RISK_PCT:.0%} below the trigger; targets are {TARGET_R:.0f}R."
+        )
+    with button_col:
+        if st.button("Run Day-Trade Scan", width="stretch"):
+            with st.spinner("Downloading 5-minute bars for the large-cap universe (up to a minute)..."):
+                try:
+                    st.session_state.daytrade_results = cached_scan_daytrade_setups()
+                    st.session_state.daytrade_error = None
+                except Exception as error:
+                    st.session_state.daytrade_results = None
+                    st.session_state.daytrade_error = str(error)
+
+    results = st.session_state.daytrade_results
+    if results is not None and results.attrs.get("universe_source") == "fallback list":
+        st.warning(
+            f"No large-cap screener answered, so this scan used a built-in list of {results.attrs.get('universe_size')} "
+            f"large caps. Screener error: {results.attrs.get('screener_error')}"
+        )
+    if results is None and st.session_state.get("daytrade_error"):
+        st.error(f"Day-trade scan failed: {st.session_state.daytrade_error}")
+        return
+    if results is None:
+        st.info(
+            "Run the scan for large caps breaking out today. It works best from 9:45 New York, once the opening range "
+            "is in; before the open it measures against the pre-market high. Results are cached for 5 minutes."
+        )
+        return
+
+    spy = results.attrs.get("benchmark_change")
+    st.caption(
+        f"{len(results)} setups | {results.attrs.get('analyzed', 'N/A')} of {results.attrs.get('universe_size', 'N/A')} "
+        f"stocks analyzed (from {results.attrs.get('universe_source', 'N/A')}) | phase: {results.attrs.get('phase', 'N/A')} | "
+        + (f"SPY {spy:+.2f}% | " if isinstance(spy, (int, float)) else "")
+        + f"{results.attrs.get('scan_timestamp', '')} | Click a row to open its 5-minute chart."
+    )
+    if isinstance(spy, (int, float)) and spy < -1:
+        st.warning("SPY is down more than 1% today. Long breakouts fail more often against a falling market.")
+    if results.empty:
+        st.warning("No large caps are at a breakout trigger on enough volume right now.")
+        return
+
+    try:
+        _, earnings_dates = get_upcoming_earnings()
+    except Exception:
+        earnings_dates = {}
+    view = add_earnings_columns(results, earnings_dates).drop(columns=["Days to ER"])
+    view["Market Cap"] = view["Market Cap"].apply(lambda value: value / 1e9 if isinstance(value, (int, float)) else None)
+    view["Dollar Volume"] = view["Dollar Volume"] / 1e6
+    sizes = [
+        position_size(account_size, risk_pct * size_factor, row["Trigger"], row["Stop"]) for _, row in view.iterrows()
+    ]
+    view["Shares"] = [size["shares"] if size else None for size in sizes]
+    view["Position"] = [size["position_value"] if size else None for size in sizes]
+    st.session_state.daytrade_display_tickers = list(view["Ticker"])
+    st.dataframe(
+        view,
+        key="daytrade_table",
+        on_select=load_daytrade_ticker,
+        selection_mode="single-row",
+        hide_index=True,
+        width="stretch",
+        height=min(39 * (len(view) + 1), 460),
+        column_config={
+            "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+            "Market Cap": st.column_config.NumberColumn("Mkt Cap", format="$%.0fB"),
+            "Trigger": st.column_config.NumberColumn("Trigger", format="$%.2f"),
+            "Trigger Level": st.column_config.TextColumn("Level"),
+            "To Trigger": st.column_config.NumberColumn("To Trigger", format="%.2f%%", help="Negative: already through it."),
+            "Stop": st.column_config.NumberColumn("Stop", format="$%.2f"),
+            "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
+            "Risk %": st.column_config.NumberColumn("Risk", format="%.2f%%"),
+            "RVOL": st.column_config.NumberColumn("RVOL", format="%.2fx", help="Volume so far vs the prior days at this time."),
+            "VWAP": st.column_config.NumberColumn("VWAP", format="$%.2f"),
+            "OR High": st.column_config.NumberColumn("OR High", format="$%.2f"),
+            "PM High": st.column_config.NumberColumn("PM High", format="$%.2f"),
+            "Prior High": st.column_config.NumberColumn("Prior High", format="$%.2f"),
+            "Change %": st.column_config.NumberColumn("Day", format="%+.2f%%"),
+            "RS vs SPY": st.column_config.NumberColumn("vs SPY", format="%+.2f%%"),
+            "Dollar Volume": st.column_config.NumberColumn("$ Vol/Day", format="$%.0fM"),
+            "Day Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
+            "Shares": st.column_config.NumberColumn(
+                "Shares", format="%d",
+                help=f"Entry at the trigger, sized to risk {risk_pct * size_factor:.2f}% of a {account_size:,.0f} USD account.",
+            ),
+            "Position": st.column_config.NumberColumn("Position", format="$%.0f"),
+            "Earnings": st.column_config.TextColumn("Earnings"),
+        },
+    )
+    st.caption(
+        f"Shares risk {risk_pct * size_factor:.2f}% of a {account_size:,.0f} USD account from trigger to stop{size_note}. "
+        f"During the session the top {DAYTRADE_TOP_N} breakouts scoring {DAYTRADE_MIN_SCORE:.0f}+ are sent to Telegram "
+        f"({DAYTRADE_FIRST_ALERT:%H:%M}-{DAYTRADE_LAST_ALERT:%H:%M} New York) and scored at the close in the Track Record tab. "
+        "Day trades are closed by the end of the session. Screening output is informational, not investment advice."
+    )
+
+
 dashboard_tab, scanner_tab, track_tab, journal_tab = st.tabs(
     [DASHBOARD_TAB, SCANNER_TAB, TRACK_RECORD_TAB, JOURNAL_TAB], key="main_view", on_change="rerun"
 )
@@ -353,7 +503,14 @@ dashboard_tab, scanner_tab, track_tab, journal_tab = st.tabs(
 scan_results = st.session_state.scanner_results
 
 with scanner_tab:
+    scanner_mode = SMALLCAP_SCANNER
     if scanner_tab.open:
+        scanner_mode = st.radio(
+            "Scanner", [SMALLCAP_SCANNER, DAYTRADE_SCANNER], horizontal=True, key="scanner_mode", label_visibility="collapsed",
+        )
+    if scanner_tab.open and scanner_mode == DAYTRADE_SCANNER:
+        render_daytrade_scanner()
+    elif scanner_tab.open:
         scan_title_col, scan_btn_col = st.columns([3, 1])
         with scan_title_col:
             st.subheader("Small-Cap Breakout Scanner")
@@ -840,8 +997,32 @@ with dashboard_tab:
 
         # Overlay breakout levels when the selected asset came from the scanner
         scanner_row = None
-        if scan_results is not None and not scan_results.empty and selected_ticker in set(scan_results["Ticker"]):
+        daytrade_results = st.session_state.daytrade_results
+        daytrade_row = None
+        if (
+            st.session_state.get("chart_levels_source") == DAYTRADE_SCANNER
+            and daytrade_results is not None and not daytrade_results.empty
+            and selected_ticker in set(daytrade_results["Ticker"])
+        ):
+            daytrade_row = daytrade_results.loc[daytrade_results["Ticker"] == selected_ticker].iloc[0].to_dict()
+        elif scan_results is not None and not scan_results.empty and selected_ticker in set(scan_results["Ticker"]):
             scanner_row = scan_results.loc[scan_results["Ticker"] == selected_ticker].iloc[0].to_dict()
+        if daytrade_row:
+            for level, label, color in (
+                ("Trigger", daytrade_row["Trigger Level"], CHART_BLUE),
+                ("Stop", "Stop", CHART_DOWN),
+                ("Target", "Target", CHART_UP),
+                ("VWAP", "VWAP (at scan)", CHART_INK),
+            ):
+                if daytrade_row.get(level) is None or pd.isna(daytrade_row.get(level)):
+                    continue
+                fig.add_hline(
+                    y=daytrade_row[level], line_dash="dot" if level == "VWAP" else "dash", line_color=color, line_width=1,
+                    annotation_text=f"{label} {daytrade_row[level]:.2f}", annotation_font_color=color,
+                    # VWAP usually sits close to the trigger, so its label goes on the other side.
+                    annotation_position="bottom left" if level == "VWAP" else "top right",
+                    row=1, col=1,
+                )
         if scanner_row:
             for level, label, color in (
                 ("Pivot", "Pivot", CHART_BLUE),
@@ -1167,6 +1348,46 @@ with track_tab:
             st.caption(
                 f"{OPEN} trades show their mark at the latest close; {WAITING} signals haven't traded through the pivot yet. "
                 "Screening output is informational, not investment advice."
+            )
+
+        st.divider()
+        st.subheader("Large-Cap Day-Trade Alerts")
+        st.caption(
+            "Every large-cap day-trade breakout sent to Telegram, played forward at the close through the rest of the "
+            "session's 5-minute bars from the alert price: out at the stop or the target, whichever came first (the stop "
+            "when one bar reached both), otherwise at the close. Results are in R."
+        )
+        try:
+            daytrade_log = load_daytrade_alerts()
+        except Exception as error:
+            daytrade_log = None
+            st.error(f"Day-trade alerts unavailable: {error}")
+        if daytrade_log is not None and daytrade_log.empty:
+            st.info("No day-trade alerts sent yet. They start with the next market session.")
+        elif daytrade_log is not None:
+            dt_summary = summarize_daytrades(daytrade_log)
+            dt1, dt2, dt3, dt4 = st.columns(4)
+            dt1.metric("Alerts", len(daytrade_log))
+            dt2.metric("Win Rate", f"{dt_summary['win_rate_pct']}%" if dt_summary["trades"] else "N/A")
+            dt3.metric("Average R", f"{dt_summary['average_r']:+.2f}R" if dt_summary["trades"] else "N/A")
+            dt4.metric("Total R", f"{dt_summary['total_r']:+.1f}R" if dt_summary["trades"] else "N/A")
+            if dt_summary["trades"]:
+                st.caption(
+                    f"{dt_summary['trades']} scored: {dt_summary['target_pct']}% hit target, {dt_summary['stop_pct']}% stopped out, "
+                    "the rest closed at the bell. Fewer than 30 trades is still mostly noise."
+                )
+            st.dataframe(
+                daytrade_log.sort_values(["Date", "Time"], ascending=False), hide_index=True, width="stretch",
+                column_config={
+                    "Price": st.column_config.NumberColumn("Alert Price", format="$%.2f"),
+                    "Trigger": st.column_config.NumberColumn("Trigger", format="$%.2f"),
+                    "Stop": st.column_config.NumberColumn("Stop", format="$%.2f"),
+                    "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
+                    "RVOL": st.column_config.NumberColumn("RVOL", format="%.1fx"),
+                    "Day Score": st.column_config.NumberColumn("Score", format="%.0f"),
+                    "Exit": st.column_config.NumberColumn("Exit", format="$%.2f"),
+                    "R": st.column_config.NumberColumn("R", format="%+.2f"),
+                },
             )
 
 with journal_tab:

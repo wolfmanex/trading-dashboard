@@ -9,7 +9,8 @@ from starting a second market session. Days are New York dates.
 
 `recap` re-checks every live signal against the day's bars, saves the log, and reports which setups
 triggered, stopped out, hit target or timed out today, how the open ones stand, how your journal
-positions closed, and whether today's scan and intraday checks actually ran.
+positions closed, the outcome of the day's large-cap day-trade alerts (written back to their CSV), and
+whether today's scan and intraday checks actually ran.
 """
 import argparse
 import os
@@ -22,6 +23,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from daytrade_alerts import read_alerts, recap_lines as daytrade_recap_lines, score_alerts
 from journal import mark_positions, open_positions, read_journal_file
 from market_calendar import is_trading_day
 from scheduled_scan import download_outcome_prices, send_telegram
@@ -174,7 +176,22 @@ def journal_lines(journal_path: str, today: str) -> list:
     return lines
 
 
-def recap(log_path: str, journal_path: str, notify, checks: int = None) -> int:
+def daytrade_lines(daytrade_path: str, today: str) -> list:
+    """Score today's day-trade alerts against the session's 5-minute bars, save them, and report them."""
+    alerts = read_alerts(daytrade_path)
+    todays = alerts[alerts["Date"] == today] if not alerts.empty else alerts
+    if not todays.empty:
+        tickers = sorted(set(todays["Ticker"].astype(str)))
+        intraday = yf.download(
+            tickers=tickers, period="1d", interval="5m", prepost=False, group_by="ticker",
+            auto_adjust=False, progress=False, threads=True,
+        )
+        alerts = score_alerts(alerts, today, intraday)
+        alerts.to_csv(daytrade_path, index=False)
+    return daytrade_recap_lines(alerts, today)
+
+
+def recap(log_path: str, journal_path: str, notify, checks: int = None, daytrade_path: str = None) -> int:
     now = datetime.now(EASTERN)
     today = now.date().isoformat()
     log = read_log(log_path)
@@ -187,6 +204,11 @@ def recap(log_path: str, journal_path: str, notify, checks: int = None) -> int:
     positions = journal_lines(journal_path, today) if journal_path else []
     if positions:
         message += ["", "<b>Your positions</b>"] + positions
+    if daytrade_path:
+        try:
+            message += ["", "<b>Large-cap day trades</b>"] + daytrade_lines(daytrade_path, today)
+        except Exception as error:
+            message += ["", "<b>Large-cap day trades</b>", f"Could not score today's alerts: {escape(str(error))}"]
     try:
         scan_runs = runs_today(SCAN_WORKFLOW, now.date())
         lines = [f"Morning scan {run_line(scan_runs)}."]
@@ -208,6 +230,7 @@ def main(argv=None) -> int:
     parser.add_argument("--checks", type=int, help="Intraday checks the session ran today (recap).")
     parser.add_argument("--log", default="signal_log.csv", help="Signal log CSV (recap).")
     parser.add_argument("--journal", help="Trade journal CSV (recap).")
+    parser.add_argument("--daytrades", help="Large-cap day-trade alerts CSV (recap); outcomes are written back.")
     args = parser.parse_args(argv)
 
     token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
@@ -249,7 +272,7 @@ def main(argv=None) -> int:
     if not is_trading_day(today):
         print(f"Market closed today ({today:%a %d %b}); no recap.")
         return 0
-    return recap(args.log, args.journal, notify, args.checks)
+    return recap(args.log, args.journal, notify, args.checks, args.daytrades)
 
 
 if __name__ == "__main__":

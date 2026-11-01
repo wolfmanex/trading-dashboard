@@ -10,7 +10,7 @@ checks=0
 save_alerts() {
     (
         cd signal-log-data || exit 0
-        for file in intraday_alerts.csv position_alerts.csv; do
+        for file in intraday_alerts.csv position_alerts.csv daytrade_alerts.csv; do
             if [ -f "$file" ]; then git add "$file"; fi
         done
         git diff --cached --quiet && exit 0
@@ -33,6 +33,9 @@ while :; do
     python intraday_alerts.py --log signal-log-data/signal_log.csv --sent signal-log-data/intraday_alerts.csv \
         --journal signal-log-data/journal.csv --position-sent signal-log-data/position_alerts.csv \
         || echo "Intraday check failed; trying again next round."
+    # Large-cap day-trade breakouts (9:45-15:30 New York; the script checks the window itself).
+    python daytrade_alerts.py --sent signal-log-data/daytrade_alerts.csv \
+        || echo "Day-trade check failed; trying again next round."
     if [[ ! "$now" < "09:45" ]]; then checks=$((checks + 1)); fi
     save_alerts
     # Sleep to a few seconds past the next quarter hour.

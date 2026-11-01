@@ -53,8 +53,18 @@ NASDAQ_HEADERS = {
 }
 
 
-def parse_screener_quotes(response, apply_bounds: bool = False) -> dict:
-    """Map Yahoo screener quotes to {ticker: {name, market_cap}}, skipping malformed rows."""
+def parse_screener_quotes(
+    response,
+    apply_bounds: bool = False,
+    min_market_cap: float = MIN_MARKET_CAP,
+    max_market_cap: float = MAX_MARKET_CAP,
+    min_price: float = MIN_PRICE,
+) -> dict:
+    """Map Yahoo screener quotes to {ticker: {name, market_cap}}, skipping malformed rows.
+
+    With apply_bounds, quotes outside the market-cap range or under the minimum price are dropped (the
+    predefined screens don't filter on them). The defaults are the small-cap bounds.
+    """
     universe = {}
     quotes = response.get("quotes") if isinstance(response, dict) else None
     for quote in quotes or []:
@@ -66,9 +76,9 @@ def parse_screener_quotes(response, apply_bounds: bool = False) -> dict:
         market_cap = quote.get("marketCap")
         if apply_bounds:
             price = quote.get("regularMarketPrice")
-            if not isinstance(market_cap, (int, float)) or not MIN_MARKET_CAP <= market_cap <= MAX_MARKET_CAP:
+            if not isinstance(market_cap, (int, float)) or not min_market_cap <= market_cap <= max_market_cap:
                 continue
-            if isinstance(price, (int, float)) and price < MIN_PRICE:
+            if isinstance(price, (int, float)) and price < min_price:
                 continue
         universe[symbol] = {
             "name": quote.get("shortName") or quote.get("longName") or symbol,
@@ -88,8 +98,16 @@ def _parse_number(value):
         return None
 
 
-def parse_nasdaq_rows(payload, limit: int = MAX_UNIVERSE) -> dict:
-    """Filter Nasdaq's all-US-stocks screener to small caps, keeping the most traded by dollar volume."""
+def parse_nasdaq_rows(
+    payload,
+    limit: int = MAX_UNIVERSE,
+    min_market_cap: float = MIN_MARKET_CAP,
+    max_market_cap: float = MAX_MARKET_CAP,
+    min_price: float = MIN_PRICE,
+    min_volume: float = MIN_AVG_SHARE_VOLUME,
+) -> dict:
+    """Filter Nasdaq's all-US-stocks screener to a market-cap range (small caps by default), keeping the
+    most traded by dollar volume."""
     data = payload.get("data") if isinstance(payload, dict) else None
     data = data if isinstance(data, dict) else {}
     rows = data.get("rows") or (data.get("table") or {}).get("rows") or []
@@ -104,9 +122,9 @@ def parse_nasdaq_rows(payload, limit: int = MAX_UNIVERSE) -> dict:
         market_cap = _parse_number(row.get("marketCap"))
         price = _parse_number(row.get("lastsale"))
         volume = _parse_number(row.get("volume"))
-        if market_cap is None or not MIN_MARKET_CAP <= market_cap <= MAX_MARKET_CAP:
+        if market_cap is None or not min_market_cap <= market_cap <= max_market_cap:
             continue
-        if price is None or price < MIN_PRICE or volume is None or volume < MIN_AVG_SHARE_VOLUME:
+        if price is None or price < min_price or volume is None or volume < min_volume:
             continue
         candidates.append((price * volume, symbol, row.get("name") or symbol, market_cap))
     candidates.sort(reverse=True)
@@ -133,8 +151,8 @@ def _yahoo_custom_universe(pages: int = 2, page_size: int = 250) -> dict:
     return universe
 
 
-def _nasdaq_universe() -> dict:
-    # Nasdaq's public screener needs no cookie or crumb, unlike Yahoo's, which returns 401 from cloud hosts.
+def fetch_nasdaq_screener() -> dict:
+    """Nasdaq's whole US-stock table. It needs no cookie or crumb, unlike Yahoo's, which returns 401 from cloud hosts."""
     response = requests.get(
         NASDAQ_SCREENER_URL,
         params={"tableonly": "true", "download": "true"},
@@ -142,7 +160,11 @@ def _nasdaq_universe() -> dict:
         timeout=20,
     )
     response.raise_for_status()
-    return parse_nasdaq_rows(response.json())
+    return response.json()
+
+
+def _nasdaq_universe() -> dict:
+    return parse_nasdaq_rows(fetch_nasdaq_screener())
 
 
 def _yahoo_predefined_universe() -> dict:
@@ -157,14 +179,13 @@ UNIVERSE_SOURCES = (
 )
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_smallcap_universe() -> tuple:
-    """Return (source name, {ticker: {name, market_cap}}) from the first small-cap source that answers.
+def first_universe(sources) -> tuple:
+    """Return (source name, universe) from the first of (name, fetch) sources that returns stocks.
 
-    Raises RuntimeError when every source fails, so a failure is never cached for an hour.
+    Raises RuntimeError naming every source's error when none answers.
     """
     errors = []
-    for name, fetch in UNIVERSE_SOURCES:
+    for name, fetch in sources:
         try:
             universe = fetch()
         except Exception as error:
@@ -174,6 +195,15 @@ def get_smallcap_universe() -> tuple:
             return name, universe
         errors.append(f"{name}: no stocks returned")
     raise RuntimeError("; ".join(errors))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_smallcap_universe() -> tuple:
+    """Return (source name, {ticker: {name, market_cap}}) from the first small-cap source that answers.
+
+    Raises RuntimeError when every source fails, so a failure is never cached for an hour.
+    """
+    return first_universe(UNIVERSE_SOURCES)
 
 
 def _ticker_frame(batch: pd.DataFrame, ticker: str) -> pd.DataFrame:

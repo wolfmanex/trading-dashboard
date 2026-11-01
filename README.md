@@ -10,12 +10,14 @@ pinned: false
 
 # AI Trading Dashboard
 
-Streamlit dashboard with multi-timeframe charts, a small-cap breakout scanner, an AI trade reviewer
+Streamlit dashboard with multi-timeframe charts, a small-cap swing breakout scanner, a large-cap day-trade
+breakout scanner (opening-range and pre-market high breaks on 5-minute bars), an AI trade reviewer
 (Gemini) with follow-up questions, a market conditions panel, a trade journal and a forward track record
 of the scanner's signals.
 
 GitHub Actions run the weekday pre-market scan (Telegram top 10 plus an AI brief), then a market session
-with breakout and journal stop/target alerts every 15 minutes, then an evening recap. GitHub's own cron never
+with breakout, large-cap day-trade and journal stop/target alerts every 15 minutes, then an evening recap
+that also scores the day's day-trade alerts. GitHub's own cron never
 fired in this repo, so a daily Claude routine starts the scan (weekdays 8:33 New York) and each step starts
 the next; the scan's cron stays as a backup and a second scan on the same day stands down.
 
