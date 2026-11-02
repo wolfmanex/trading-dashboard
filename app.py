@@ -37,7 +37,9 @@ from signal_log import (
 )
 from scheduled_scan import TOP_N as ALERTED_TOP_N
 from breakout_engine import MIN_ATR_PCT, MIN_STOP_PCT
-from daytrade_engine import MAX_BELOW_TRIGGER, MAX_EXTENSION, MAX_RISK_PCT, MIN_RISK_PCT, MIN_RVOL, TARGET_R
+from daytrade_engine import (
+    MAX_BELOW_TRIGGER, MAX_EXTENSION, MAX_RISK_PCT, MIN_RISK_PCT, MIN_RVOL, OPENING_RANGE_MINUTES, TARGET_R,
+)
 from daytrade_alerts import (
     DAYTRADE_LOG_URL, FIRST_ALERT as DAYTRADE_FIRST_ALERT, LAST_ALERT as DAYTRADE_LAST_ALERT, MIN_SCORE as DAYTRADE_MIN_SCORE,
     TOP_N as DAYTRADE_TOP_N, fetch_published_alerts, summarize_daytrades,
@@ -214,7 +216,7 @@ def load_scanner_ticker():
 
 
 def load_daytrade_ticker():
-    """Open the clicked day-trade setup on the dashboard's 5-minute chart with its trigger, stop and target."""
+    """Open the clicked day-trade setup on the dashboard's 15-minute chart with its trigger, stop and target."""
     selection = st.session_state.get("daytrade_table")
     rows = selection.selection.rows if selection else []
     tickers = st.session_state.get("daytrade_display_tickers", [])
@@ -223,13 +225,13 @@ def load_daytrade_ticker():
         st.session_state.custom_ticker = tickers[rows[0]]
         st.session_state.custom_ticker_value = tickers[rows[0]]
         st.session_state.analysis_mode = INTRADAY_MODE
-        st.session_state.timeframe = "5m"
+        st.session_state.timeframe = "15m"
         st.session_state.main_view = DASHBOARD_TAB
         st.session_state.chart_levels_source = DAYTRADE_SCANNER
 
 
 def match_timeframe_to_horizon():
-    st.session_state.timeframe = "5m" if st.session_state.analysis_mode == INTRADAY_MODE else "1d"
+    st.session_state.timeframe = "15m" if st.session_state.analysis_mode == INTRADAY_MODE else "1d"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -401,10 +403,10 @@ def render_daytrade_scanner() -> None:
         st.caption(
             f"The {LARGECAP_UNIVERSE} most traded US stocks above {LARGECAP_MIN_MARKET_CAP / 1e9:,.0f}B USD market cap with "
             f"at least {LARGECAP_MIN_DOLLAR_VOLUME / 1e6:,.0f}M USD traded a day, on 5-minute bars. The trigger is the "
-            f"15-minute opening-range high (the pre-market high before the open). Listed: within "
-            f"{MAX_BELOW_TRIGGER:.1%} under the trigger or up to {MAX_EXTENSION:.0%} through it, above VWAP, on at least "
+            f"{OPENING_RANGE_MINUTES}-minute opening-range high (the pre-market high before the open). Listed: within "
+            f"{MAX_BELOW_TRIGGER:.0%} under the trigger or up to {MAX_EXTENSION:.1%} through it, above VWAP, on at least "
             f"{MIN_RVOL:.1f}x the usual volume for this time of day. Stops sit under the tighter of the opening-range "
-            f"low and VWAP, {MIN_RISK_PCT:.1%}-{MAX_RISK_PCT:.0%} below the trigger; targets are {TARGET_R:.0f}R."
+            f"low and VWAP, {MIN_RISK_PCT:.0%}-{MAX_RISK_PCT:.0%} below the trigger; targets are {TARGET_R:.0f}R."
         )
     with button_col:
         if st.button("Run Day-Trade Scan", width="stretch"):
@@ -427,7 +429,7 @@ def render_daytrade_scanner() -> None:
         return
     if results is None:
         st.info(
-            "Run the scan for large caps breaking out today. It works best from 9:45 New York, once the opening range "
+            f"Run the scan for large caps breaking out today. It works best from {DAYTRADE_FIRST_ALERT:%H:%M} New York, once the opening range "
             "is in; before the open it measures against the pre-market high. Results are cached for 5 minutes."
         )
         return
@@ -437,7 +439,7 @@ def render_daytrade_scanner() -> None:
         f"{len(results)} setups | {results.attrs.get('analyzed', 'N/A')} of {results.attrs.get('universe_size', 'N/A')} "
         f"stocks analyzed (from {results.attrs.get('universe_source', 'N/A')}) | phase: {results.attrs.get('phase', 'N/A')} | "
         + (f"SPY {spy:+.2f}% | " if isinstance(spy, (int, float)) else "")
-        + f"{results.attrs.get('scan_timestamp', '')} | Click a row to open its 5-minute chart."
+        + f"{results.attrs.get('scan_timestamp', '')} | Click a row to open its 15-minute chart."
     )
     if isinstance(spy, (int, float)) and spy < -1:
         st.warning("SPY is down more than 1% today. Long breakouts fail more often against a falling market.")

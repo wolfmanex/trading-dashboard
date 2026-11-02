@@ -11,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 from yfinance import EquityQuery
 
-from daytrade_engine import MIN_RVOL, analyze_daytrade_setup, day_change_pct, rank_daytrade_candidates
+from daytrade_engine import MIN_RVOL, OPENING_RANGE_MINUTES, analyze_daytrade_setup, day_change_pct, rank_daytrade_candidates
 from smallcap_screener import (
     US_EXCHANGES, _ticker_frame, fetch_nasdaq_screener, first_universe, parse_nasdaq_rows, parse_screener_quotes,
 )
@@ -107,6 +107,7 @@ def scan_daytrade_setups(
     min_rvol: float = MIN_RVOL,
     min_dollar_volume: float = MIN_DOLLAR_VOLUME,
     limit: int = 25,
+    opening_range_minutes: int = OPENING_RANGE_MINUTES,
 ) -> pd.DataFrame:
     """Screen the large-cap universe for intraday breakouts using one batched 5-minute download."""
     universe_source, universe, screener_error = load_universe()
@@ -122,7 +123,7 @@ def scan_daytrade_setups(
     setups = {}
     for ticker in tickers:
         try:
-            setups[ticker] = analyze_daytrade_setup(_ticker_frame(batch, ticker), benchmark_change)
+            setups[ticker] = analyze_daytrade_setup(_ticker_frame(batch, ticker), benchmark_change, opening_range_minutes)
         except Exception as error:
             print(f"Day-trade analysis failed for {ticker}: {error}")
 

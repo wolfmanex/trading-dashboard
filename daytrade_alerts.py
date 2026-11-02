@@ -24,7 +24,7 @@ from smallcap_screener import _ticker_frame
 
 
 EASTERN = ZoneInfo("America/New_York")
-FIRST_ALERT = time(9, 45)   # once the 15-minute opening range is in
+FIRST_ALERT = time(10, 0)   # once the 30-minute opening range is in
 LAST_ALERT = time(15, 30)   # too little session left to work a trade after this
 TOP_N = 5
 MIN_SCORE = 60.0

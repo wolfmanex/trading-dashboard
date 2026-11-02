@@ -1,6 +1,6 @@
 """Intraday breakout setups for liquid large caps, measured from 5-minute bars (pre-market included).
 
-The trigger is the opening-range high once the first 15 minutes have traded, and the pre-market high
+The trigger is the opening-range high once the first 30 minutes have traded, and the pre-market high
 (or, without pre-market trading, the prior day's high) before that. A setup is listed when the price
 sits just under the trigger or has broken it by no more than MAX_EXTENSION, on at least MIN_RVOL times
 the normal volume for this point in the day and, during the session, above VWAP.
@@ -19,12 +19,15 @@ EASTERN = "America/New_York"
 PREMARKET_OPEN = time(4, 0)
 SESSION_OPEN = time(9, 30)
 SESSION_CLOSE = time(16, 0)
-OPENING_RANGE_BARS = 3          # 15 minutes of 5-minute bars
-MAX_BELOW_TRIGGER = 0.015       # list setups up to 1.5% under the trigger
-MAX_EXTENSION = 0.01            # and up to 1% over it; further is chasing
+BAR_MINUTES = 5
+# 30 minutes rather than 15: the first quarter hour's swings set off too many false breakouts and
+# leave stops inside normal noise.
+OPENING_RANGE_MINUTES = 30
+MAX_BELOW_TRIGGER = 0.02        # list setups up to 2% under the trigger
+MAX_EXTENSION = 0.015           # and up to 1.5% over it; further is chasing
 MIN_RVOL = 1.5
-MIN_RISK_PCT = 0.005            # a stop never sits closer than 0.5% under the trigger
-MAX_RISK_PCT = 0.02             # nor further than 2%
+MIN_RISK_PCT = 0.01             # a stop never sits closer than 1% under the trigger
+MAX_RISK_PCT = 0.03             # nor further than 3%
 TARGET_R = 2.0
 
 PHASE_PREMARKET = "Pre-market"
@@ -118,7 +121,9 @@ def day_change_pct(bars: pd.DataFrame) -> float | None:
     return (float(latest["Close"].iloc[-1]) / prior_close - 1) * 100 if prior_close > 0 else None
 
 
-def analyze_daytrade_setup(bars: pd.DataFrame, benchmark_change: float | None = None) -> dict | None:
+def analyze_daytrade_setup(
+    bars: pd.DataFrame, benchmark_change: float | None = None, opening_range_minutes: int = OPENING_RANGE_MINUTES,
+) -> dict | None:
     """Measure today's 5-minute bars (with pre-market) against the opening range, VWAP and prior day.
 
     Needs today plus at least one prior day with regular-session bars; the relative-volume baseline is
@@ -147,14 +152,15 @@ def analyze_daytrade_setup(bars: pd.DataFrame, benchmark_change: float | None = 
     pm_high = float(premarket["High"].max()) if not premarket.empty else None
     pm_low = float(premarket["Low"].min()) if not premarket.empty else None
 
+    range_bars = max(opening_range_minutes // BAR_MINUTES, 1)
     if regular.empty:
         phase = PHASE_PREMARKET
-    elif len(regular) < OPENING_RANGE_BARS:
+    elif len(regular) < range_bars:
         phase = PHASE_OPENING
     else:
         phase = PHASE_SESSION
 
-    opening = regular.iloc[:OPENING_RANGE_BARS]
+    opening = regular.iloc[:range_bars]
     or_high = float(opening["High"].max()) if phase == PHASE_SESSION else None
     or_low = float(opening["Low"].min()) if phase == PHASE_SESSION else None
     vwap = session_vwap(regular)
