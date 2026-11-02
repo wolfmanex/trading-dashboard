@@ -40,9 +40,9 @@ def history(today_regular=None, today_premarket=None, prior_price=100.0, prior_v
 
 
 def breakout_day():
-    """Opening range 101-102, then a push to 102.3 on heavy volume, above VWAP."""
-    opening = day_bars("2026-10-30", "09:30", "09:45", 101.5, 40_000, high_pad=0.5, low_pad=0.5)
-    push = day_bars("2026-10-30", "09:45", "10:15", 102.1, 30_000, high_pad=0.2, low_pad=0.1)
+    """Opening range (9:30-10:00) 101-102, then a push to 102.3 on heavy volume, above VWAP."""
+    opening = day_bars("2026-10-30", "09:30", "10:00", 101.5, 40_000, high_pad=0.5, low_pad=0.5)
+    push = day_bars("2026-10-30", "10:00", "10:30", 102.1, 30_000, high_pad=0.2, low_pad=0.1)
     push.iloc[-1, push.columns.get_loc("Close")] = 102.3
     push.iloc[-1, push.columns.get_loc("High")] = 102.4
     premarket = day_bars("2026-10-30", "08:00", "09:30", 101.0, 3_000, high_pad=0.3, low_pad=0.3)
@@ -87,10 +87,18 @@ class DayTradeSetupTests(unittest.TestCase):
         self.assertLessEqual(setup["risk_pct"], MAX_RISK_PCT + 1e-9)
         self.assertAlmostEqual(setup["target"], setup["trigger"] + 2 * (setup["trigger"] - setup["stop"]))
 
+    def test_opening_range_length_is_configurable(self):
+        bars = breakout_day()
+        self.assertAlmostEqual(analyze_daytrade_setup(bars)["trigger"], 102.0)   # 30-minute default
+        # Before 10:00 a 30-minute range isn't complete; a 15-minute one is.
+        early = bars[bars.index < pd.Timestamp("2026-10-30 09:50", tz=EASTERN)]
+        self.assertEqual(analyze_daytrade_setup(early)["trigger_level"], "PM high")
+        self.assertEqual(analyze_daytrade_setup(early, opening_range_minutes=15)["trigger_level"], "OR high")
+
     def test_relative_volume_compares_the_same_stretch_of_prior_sessions(self):
         setup = analyze_daytrade_setup(breakout_day())
-        # Today: 3 bars x 40k + 6 bars x 30k = 300k by 10:10; prior days: 9 bars x 10k = 90k.
-        self.assertAlmostEqual(setup["rvol"], 300_000 / 90_000, places=3)
+        # Today: 6 bars x 40k + 6 bars x 30k = 420k by 10:25; prior days: 12 bars x 10k = 120k.
+        self.assertAlmostEqual(setup["rvol"], 420_000 / 120_000, places=3)
         self.assertAlmostEqual(setup["avg_dollar_volume"], 100.0 * 10_000 * 78)
 
     def test_premarket_uses_premarket_high_as_trigger(self):
@@ -105,8 +113,8 @@ class DayTradeSetupTests(unittest.TestCase):
         self.assertTrue(setup["above_vwap"])
 
     def test_stop_is_capped_at_max_risk(self):
-        opening = day_bars("2026-10-30", "09:30", "09:45", 100.0, 40_000, high_pad=5.0, low_pad=5.0)
-        later = day_bars("2026-10-30", "09:45", "10:00", 104.8, 40_000, high_pad=0.1, low_pad=0.1)
+        opening = day_bars("2026-10-30", "09:30", "10:00", 100.0, 40_000, high_pad=5.0, low_pad=5.0)
+        later = day_bars("2026-10-30", "10:00", "10:15", 104.8, 40_000, high_pad=0.1, low_pad=0.1)
         setup = analyze_daytrade_setup(history(pd.concat([opening, later])))
         self.assertAlmostEqual(setup["stop"], setup["trigger"] * (1 - MAX_RISK_PCT))
 
@@ -245,7 +253,8 @@ class DayTradeAlertTests(unittest.TestCase):
         return ranked
 
     def test_alert_window(self):
-        self.assertTrue(daytrade_alerts.in_alert_window(datetime(2026, 10, 30, 9, 45, tzinfo=EASTERN)))
+        self.assertFalse(daytrade_alerts.in_alert_window(datetime(2026, 10, 30, 9, 45, tzinfo=EASTERN)))  # range not in yet
+        self.assertTrue(daytrade_alerts.in_alert_window(datetime(2026, 10, 30, 10, 0, tzinfo=EASTERN)))
         self.assertFalse(daytrade_alerts.in_alert_window(datetime(2026, 10, 30, 15, 30, tzinfo=EASTERN)))
         self.assertFalse(daytrade_alerts.in_alert_window(datetime(2026, 10, 31, 11, 0, tzinfo=EASTERN)))  # Saturday
 
