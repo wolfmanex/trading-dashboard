@@ -36,6 +36,7 @@ from signal_log import (
     LOG_URL, OPEN, WAITING, fetch_published_log, live_pick_states, summarize_by_grade, summarize_log,
 )
 from scheduled_scan import TOP_N as ALERTED_TOP_N
+from track_record_export import build_track_record_workbook
 from breakout_engine import MIN_ATR_PCT, MIN_STOP_PCT
 from daytrade_engine import (
     MAX_BELOW_TRIGGER, MAX_EXTENSION, MAX_RISK_PCT, MIN_RISK_PCT, MIN_RVOL, OPENING_RANGE_MINUTES, TARGET_R,
@@ -1279,10 +1280,25 @@ with track_tab:
             "Results are in R (multiples of the initial risk)."
         )
         try:
-            signal_log = load_signal_log()
+            signal_log, signal_log_error = load_signal_log(), None
         except Exception as error:
-            signal_log = None
-            st.error(f"Signal log unavailable: {error}")
+            signal_log, signal_log_error = None, error
+        try:
+            daytrade_log, daytrade_log_error = load_daytrade_alerts(), None
+        except Exception as error:
+            daytrade_log, daytrade_log_error = None, error
+
+        if (signal_log is not None and not signal_log.empty) or (daytrade_log is not None and not daytrade_log.empty):
+            st.download_button(
+                "Export to Excel",
+                data=build_track_record_workbook(signal_log, daytrade_log, top_n=ALERTED_TOP_N),
+                file_name=f"track-record-{pd.Timestamp.today():%Y-%m-%d}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="export_track_record",
+                help="Summary, every logged swing signal, the AI-grade split and the large-cap day trades, one sheet each.",
+            )
+        if signal_log_error is not None:
+            st.error(f"Signal log unavailable: {signal_log_error}")
 
         if signal_log is not None and signal_log.empty:
             st.info("No signals logged yet. The first ones appear after the next scheduled scan (weekdays, before the US open).")
@@ -1366,11 +1382,8 @@ with track_tab:
             "session's 5-minute bars from the alert price: out at the stop or the target, whichever came first (the stop "
             "when one bar reached both), otherwise at the close. Results are in R."
         )
-        try:
-            daytrade_log = load_daytrade_alerts()
-        except Exception as error:
-            daytrade_log = None
-            st.error(f"Day-trade alerts unavailable: {error}")
+        if daytrade_log_error is not None:
+            st.error(f"Day-trade alerts unavailable: {daytrade_log_error}")
         if daytrade_log is not None and daytrade_log.empty:
             st.info("No day-trade alerts sent yet. They start with the next market session.")
         elif daytrade_log is not None:
