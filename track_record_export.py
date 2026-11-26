@@ -6,6 +6,7 @@ import pandas as pd
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from daytrade_feedback import build_feedback
 from daytrade_alerts import summarize_daytrades
 from signal_log import summarize_by_grade, summarize_log
 
@@ -125,4 +126,7 @@ def build_track_record_workbook(signal_log: pd.DataFrame = None, daytrade_log: p
             if not trades.empty:
                 trades = trades.sort_values(["Date", "Time"], ascending=False)
             _write_sheet(writer, _numeric(trades), "Day Trades")
+            feedback = build_feedback(daytrade_log)
+            if not feedback["table"].empty:
+                _write_sheet(writer, feedback["table"], "Day-Trade Feedback")
     return buffer.getvalue()

@@ -9,7 +9,7 @@ from starting a second market session. Days are New York dates.
 
 `recap` re-checks every live signal against the day's bars, saves the log, and reports which setups
 triggered, stopped out, hit target or timed out today, how the open ones stand, how your journal
-positions closed, the outcome of the day's large-cap day-trade alerts (written back to their CSV), and
+positions closed, the large-cap day-trade alerts replayed until their stop or target (written back to their CSV), and
 whether today's scan and intraday checks actually ran.
 """
 import argparse
@@ -176,17 +176,37 @@ def journal_lines(journal_path: str, today: str) -> list:
     return lines
 
 
-def daytrade_lines(daytrade_path: str, today: str) -> list:
-    """Score today's day-trade alerts against the session's 5-minute bars, save them, and report them."""
-    alerts = read_alerts(daytrade_path)
-    todays = alerts[alerts["Date"] == today] if not alerts.empty else alerts
-    if not todays.empty:
-        tickers = sorted(set(todays["Ticker"].astype(str)))
-        intraday = yf.download(
-            tickers=tickers, period="1d", interval="5m", prepost=False, group_by="ticker",
+def download_open_trade_bars(alerts: pd.DataFrame, today: str) -> dict:
+    """Regular-session bars reaching back to each still-open day trade's alert day, {ticker: bars}.
+
+    5-minute bars while the oldest open alert is inside Yahoo's 60-day window for them, hourly bars
+    (two years back) for older ones.
+    """
+    from daytrade_alerts import is_closed
+    pending = alerts[~is_closed(alerts) & (alerts["Outcome"] != "Invalid") & (alerts["Date"] <= today)]
+    if pending.empty:
+        return {}
+    bars = {}
+    age = (pd.Timestamp(today) - pd.to_datetime(pending["Date"])).dt.days
+    for interval, rows, limit in (("5m", pending[age <= 55], 60), ("60m", pending[age > 55], 729)):
+        if rows.empty:
+            continue
+        tickers = sorted(set(rows["Ticker"].astype(str)))
+        days = min(int((pd.Timestamp(today) - pd.to_datetime(rows["Date"]).min()).days) + 3, limit)
+        batch = yf.download(
+            tickers=tickers, period=f"{days}d", interval=interval, prepost=False, group_by="ticker",
             auto_adjust=False, progress=False, threads=True,
         )
-        alerts = score_alerts(alerts, today, intraday)
+        for ticker in tickers:
+            bars[ticker] = _ticker_frame(batch, ticker)
+    return bars
+
+
+def daytrade_lines(daytrade_path: str, today: str) -> list:
+    """Replay the still-open day-trade alerts (today's and carried-over ones), save them, and report them."""
+    alerts = read_alerts(daytrade_path)
+    if not alerts.empty:
+        alerts = score_alerts(alerts, today, download_open_trade_bars(alerts, today))
         alerts.to_csv(daytrade_path, index=False)
     return daytrade_recap_lines(alerts, today)
 

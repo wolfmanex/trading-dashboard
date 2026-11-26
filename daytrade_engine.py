@@ -5,8 +5,11 @@ The trigger is the opening-range high once the first 30 minutes have traded, and
 sits just under the trigger or has broken it by no more than MAX_EXTENSION, on at least MIN_RVOL times
 the normal volume for this point in the day and, during the session, above VWAP.
 
-Stops sit under the tighter of the opening-range low and VWAP, kept between MIN_RISK_PCT and
-MAX_RISK_PCT of the trigger, and the target is TARGET_R times that risk above the trigger. Everything
+Risk is measured from the entry: the current price once it is through the trigger, the trigger before.
+Stops sit under the tighter of the opening-range low and VWAP, kept between MIN_STOP_ATR and
+MAX_STOP_ATR of the stock's average daily range (ATR, from the prior sessions' bars) and never more
+than MAX_RISK_PCT under the entry; the target is TARGET_R times that risk above the entry. Stocks whose
+ATR is under MIN_ATR_PCT of the price rarely travel far enough in a day and are not listed. Everything
 here is pure (no downloads) so the scanner, the alerts and the tests share it.
 """
 from datetime import time
@@ -24,10 +27,16 @@ BAR_MINUTES = 5
 # leave stops inside normal noise.
 OPENING_RANGE_MINUTES = 30
 MAX_BELOW_TRIGGER = 0.02        # list setups up to 2% under the trigger
-MAX_EXTENSION = 0.015           # and up to 1.5% over it; further is chasing
-MIN_RVOL = 1.5
-MIN_RISK_PCT = 0.01             # a stop never sits closer than 1% under the trigger
-MAX_RISK_PCT = 0.03             # nor further than 3%
+# Up to 1% over it (was 1.5%). With risk now measured from the entry an extended entry no longer
+# shrinks the reward/risk, and in the 2-25 Nov 2026 record extension alone didn't predict losses,
+# so this stays moderate; the feedback loop's "Through trigger" buckets keep watching it.
+MAX_EXTENSION = 0.01
+MIN_RVOL = 2.0                  # under 2x lost the most in the same review
+MIN_ATR_PCT = 0.015             # defensive names with smaller daily ranges almost never reached target
+MIN_STOP_ATR = 0.5              # a stop never sits closer than half a day's average range under the entry
+MAX_STOP_ATR = 1.0              # nor further than a full day's range
+MIN_RISK_PCT = 0.005            # and in any case 0.5%-3% under the entry
+MAX_RISK_PCT = 0.03
 TARGET_R = 2.0
 
 PHASE_PREMARKET = "Pre-market"
@@ -47,7 +56,7 @@ SCORE_WEIGHTS = {
 
 DAYTRADE_COLUMNS = [
     "Ticker", "Name", "Price", "Market Cap", "Status", "Trigger", "Trigger Level", "To Trigger", "Stop",
-    "Target", "Risk %", "RVOL", "VWAP", "OR High", "PM High", "Prior High", "Change %", "RS vs SPY",
+    "Target", "Risk %", "ATR %", "RVOL", "VWAP", "OR High", "PM High", "Prior High", "Change %", "RS vs SPY",
     "Dollar Volume", "Day Score",
 ]
 
@@ -97,6 +106,21 @@ def _volume_through(frame: pd.DataFrame, minute: int) -> float:
         return 0.0
     minutes = np.array([_minutes(ts) for ts in frame.index])
     return float(frame["Volume"][minutes <= minute].sum())
+
+
+def average_daily_range(sessions: dict, prior_days: list) -> float | None:
+    """Average true range of the prior regular sessions (up to the last five)."""
+    ranges, previous_close = [], None
+    for day in prior_days[-6:]:
+        regular = sessions[day]["regular"]
+        high, low, close = float(regular["High"].max()), float(regular["Low"].min()), float(regular["Close"].iloc[-1])
+        if previous_close is not None:
+            ranges.append(max(high, previous_close) - min(low, previous_close))
+        elif len(prior_days) == 1:
+            ranges.append(high - low)
+        previous_close = close
+    ranges = ranges[-5:]
+    return float(np.mean(ranges)) if ranges else None
 
 
 def session_vwap(regular: pd.DataFrame) -> float | None:
@@ -172,13 +196,18 @@ def analyze_daytrade_setup(
     else:
         trigger, trigger_level, stop_candidates = prior_high, "Prior high", [vwap]
 
-    # The tightest of the candidate stops that leaves at least MIN_RISK_PCT, never wider than MAX_RISK_PCT.
-    loosest_allowed = trigger * (1 - MAX_RISK_PCT)
-    tightest_allowed = trigger * (1 - MIN_RISK_PCT)
+    # Risk is taken from where the trade would be entered: the price once through the trigger.
+    entry = max(price, trigger)
+    atr = average_daily_range(sessions, prior_days)
+    min_risk = max(MIN_STOP_ATR * atr, entry * MIN_RISK_PCT) if atr else entry * MIN_RISK_PCT
+    max_risk = min(max(MAX_STOP_ATR * atr, min_risk), entry * MAX_RISK_PCT) if atr else entry * MAX_RISK_PCT
+    min_risk = min(min_risk, max_risk)
+    # The tightest candidate stop that leaves at least min_risk, never wider than max_risk.
+    tightest_allowed, loosest_allowed = entry - min_risk, entry - max_risk
     valid = [level for level in stop_candidates if level is not None and level <= tightest_allowed]
     stop = max(max(valid) if valid else tightest_allowed, loosest_allowed)
-    risk = trigger - stop
-    target = trigger + TARGET_R * risk
+    risk = entry - stop
+    target = entry + TARGET_R * risk
 
     # Relative volume: today's volume so far against the prior days' volume through the same minute
     # (pre-market against pre-market, the session from the open against the same stretch of the session).
@@ -205,7 +234,9 @@ def analyze_daytrade_setup(
         "status": BREAKING_OUT if distance <= 0 else NEAR_TRIGGER,
         "stop": stop,
         "target": target,
-        "risk_pct": risk / trigger,
+        "entry": entry,
+        "risk_pct": risk / entry,
+        "atr_pct": atr / price if atr else None,
         "rvol": rvol,
         "vwap": vwap,
         "above_vwap": vwap is None or price > vwap,
@@ -241,13 +272,14 @@ def score_daytrade(setup: dict, rs_percentile: float = 0.5) -> float:
     return round(100 * sum(SCORE_WEIGHTS[key] * value for key, value in components.items()), 1)
 
 
-def qualifies_daytrade(setup: dict, min_rvol: float, min_dollar_volume: float) -> bool:
+def qualifies_daytrade(setup: dict, min_rvol: float, min_dollar_volume: float, min_atr_pct: float = MIN_ATR_PCT) -> bool:
     return bool(
         setup
         and -MAX_EXTENSION <= setup["distance_to_trigger"] <= MAX_BELOW_TRIGGER
         and setup["above_vwap"]
         and setup["rvol"] >= min_rvol
         and setup["avg_dollar_volume"] >= min_dollar_volume
+        and (setup.get("atr_pct") is None or setup["atr_pct"] >= min_atr_pct)
     )
 
 
@@ -290,6 +322,7 @@ def rank_daytrade_candidates(
             "Stop": _round(setup["stop"]),
             "Target": _round(setup["target"]),
             "Risk %": _round(setup["risk_pct"] * 100),
+            "ATR %": _round(setup["atr_pct"] * 100) if setup.get("atr_pct") is not None else None,
             "RVOL": _round(setup["rvol"]),
             "VWAP": _round(setup["vwap"]),
             "OR High": _round(setup["or_high"]),
@@ -304,22 +337,48 @@ def rank_daytrade_candidates(
     return ranked.sort_values(["Day Score", "RVOL"], ascending=False).head(limit).reset_index(drop=True)
 
 
-def evaluate_daytrade(entry: float, stop: float, target: float, bars_after: pd.DataFrame) -> dict:
-    """Play an alerted day trade forward through the rest of the session's bars.
+OPEN_TRADE = "Open"
+TIME_EXIT = "Time"
+CLOSED_OUTCOMES = ("Target", "Stop", TIME_EXIT)
+# A carried trade that has reached neither level by the close of this many trading days after the
+# alert day is closed there, so capital isn't tied up in trades that went nowhere.
+MAX_HOLD_DAYS = 5
 
-    Exits at the stop or the target, whichever the bars reach first (the stop when one bar spans both,
-    to stay conservative), otherwise at the last close. R is measured from the alert price.
+
+def evaluate_daytrade(
+    entry: float, stop: float, target: float, bars_after: pd.DataFrame, max_hold_days: int = MAX_HOLD_DAYS,
+) -> dict:
+    """Play an alerted trade forward through the regular-session bars since the alert, across days.
+
+    The trade closes at the stop or the target, whichever the bars reach first (the stop when one bar
+    spans both, to stay conservative). A bar that opens through a level, such as a gap the next morning,
+    fills at that bar's open. With neither reached by the close of the max_hold_days-th trading day after
+    the alert day, it closes there ("Time"). Until then it is "Open", marked at the last close.
+    R is measured from the alert price.
     """
     risk = entry - stop
     if risk <= 0:
-        return {"Outcome": "Invalid", "Exit": None, "R": None}
-    outcome, exit_price = "Close", entry
-    for _, bar in (bars_after if bars_after is not None else pd.DataFrame()).iterrows():
+        return {"Outcome": "Invalid", "Exit": None, "R": None, "Exit Date": None}
+    bars = bars_after if bars_after is not None else pd.DataFrame()
+    outcome, exit_price, exit_date = OPEN_TRADE, entry, None
+    days_seen = []
+    for timestamp, bar in bars.iterrows():
+        bar_open = float(bar["Open"]) if "Open" in bar and pd.notna(bar["Open"]) else None
+        bar_date = timestamp.date().isoformat() if hasattr(timestamp, "date") else None
+        if bar_date is not None and bar_date not in days_seen:
+            if max_hold_days is not None and len(days_seen) > max_hold_days:
+                outcome = TIME_EXIT   # the previous bar was the last close of the holding period
+                break
+            days_seen.append(bar_date)
+        exit_date = bar_date
         if bar["Low"] <= stop:
-            outcome, exit_price = "Stop", stop
+            outcome, exit_price = "Stop", min(stop, bar_open) if bar_open is not None else stop
             break
         if bar["High"] >= target:
-            outcome, exit_price = "Target", target
+            outcome, exit_price = "Target", max(target, bar_open) if bar_open is not None else target
             break
         exit_price = float(bar["Close"])
-    return {"Outcome": outcome, "Exit": round(float(exit_price), 2), "R": round((exit_price - entry) / risk, 2)}
+    return {
+        "Outcome": outcome, "Exit": round(float(exit_price), 2), "R": round((exit_price - entry) / risk, 2),
+        "Exit Date": exit_date,
+    }
