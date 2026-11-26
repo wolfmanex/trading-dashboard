@@ -36,7 +36,7 @@ def open_book(data):
 class TrackRecordExportTests(unittest.TestCase):
     def test_one_sheet_per_table_with_real_numbers(self):
         book = open_book(build_track_record_workbook(signal_log(), daytrade_log(), top_n=10, generated=datetime(2026, 11, 5)))
-        self.assertEqual(book.sheetnames, ["Summary", "Swing Signals", "By AI Grade", "Day Trades"])
+        self.assertEqual(book.sheetnames, ["Summary", "Swing Signals", "By AI Grade", "Day Trades", "Day-Trade Feedback"])
 
         signals = pd.read_excel(io.BytesIO(build_track_record_workbook(signal_log(), daytrade_log())), sheet_name="Swing Signals")
         self.assertEqual(list(signals["Ticker"]), ["CCC", "BBB", "AAA"])   # newest scan first, like the tab
@@ -56,7 +56,7 @@ class TrackRecordExportTests(unittest.TestCase):
 
     def test_a_missing_or_empty_log_still_exports_the_rest(self):
         book = open_book(build_track_record_workbook(None, daytrade_log()))
-        self.assertEqual(book.sheetnames, ["Summary", "Day Trades"])
+        self.assertEqual(book.sheetnames, ["Summary", "Day Trades", "Day-Trade Feedback"])
         book = open_book(build_track_record_workbook(empty_log(), read_alerts("/nonexistent.csv")))
         self.assertEqual(book.sheetnames, ["Summary", "Swing Signals", "Day Trades"])
 

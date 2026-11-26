@@ -1,4 +1,6 @@
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
@@ -41,6 +43,7 @@ from breakout_engine import MIN_ATR_PCT, MIN_STOP_PCT
 from daytrade_engine import (
     MAX_BELOW_TRIGGER, MAX_EXTENSION, MAX_RISK_PCT, MIN_RISK_PCT, MIN_RVOL, OPENING_RANGE_MINUTES, TARGET_R,
 )
+from daytrade_feedback import apply_feedback, build_feedback, feedback_line
 from daytrade_alerts import (
     DAYTRADE_LOG_URL, FIRST_ALERT as DAYTRADE_FIRST_ALERT, LAST_ALERT as DAYTRADE_LAST_ALERT, MIN_SCORE as DAYTRADE_MIN_SCORE,
     TOP_N as DAYTRADE_TOP_N, fetch_published_alerts, summarize_daytrades,
@@ -448,6 +451,19 @@ def render_daytrade_scanner() -> None:
         st.warning("No large caps are at a breakout trigger on enough volume right now.")
         return
 
+    # Feedback loop: the published alerts' record nudges each setup's score (daytrade_feedback.py).
+    try:
+        feedback = build_feedback(load_daytrade_alerts())
+    except Exception as error:
+        feedback = {"trades": 0, "active": False, "average_r": None}
+        st.caption(f"Track record unavailable, scores are unadjusted: {error}")
+    now_ny = datetime.now(ZoneInfo("America/New_York"))
+    attrs = dict(results.attrs)
+    results = apply_feedback(results, feedback, now_minute=now_ny.hour * 60 + now_ny.minute, spy_change=spy)
+    results = results.sort_values(["Adj Score", "RVOL"], ascending=False).reset_index(drop=True)
+    results.attrs.update(attrs)
+    st.caption(feedback_line(feedback) + " The Adj column is the score the Telegram alerts rank by.")
+
     try:
         _, earnings_dates = get_upcoming_earnings()
     except Exception:
@@ -487,6 +503,9 @@ def render_daytrade_scanner() -> None:
             "RS vs SPY": st.column_config.NumberColumn("vs SPY", format="%+.2f%%"),
             "Dollar Volume": st.column_config.NumberColumn("$ Vol/Day", format="$%.0fM"),
             "Day Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
+            "History Adj": st.column_config.NumberColumn("Hist", format="%+.0f", help="Score points from how similar past alerts did."),
+            "Adj Score": st.column_config.NumberColumn("Adj", format="%.0f", help="Day score plus the track-record adjustment."),
+            "History Note": st.column_config.TextColumn("Track record", help="The bucket that moved the score most."),
             "Shares": st.column_config.NumberColumn(
                 "Shares", format="%d",
                 help=f"Entry at the trigger, sized to risk {risk_pct * size_factor:.2f}% of a {account_size:,.0f} USD account.",
@@ -499,7 +518,8 @@ def render_daytrade_scanner() -> None:
         f"Shares risk {risk_pct * size_factor:.2f}% of a {account_size:,.0f} USD account from trigger to stop{size_note}. "
         f"During the session the top {DAYTRADE_TOP_N} breakouts scoring {DAYTRADE_MIN_SCORE:.0f}+ are sent to Telegram "
         f"({DAYTRADE_FIRST_ALERT:%H:%M}-{DAYTRADE_LAST_ALERT:%H:%M} New York) and scored at the close in the Track Record tab. "
-        "Day trades are closed by the end of the session. Screening output is informational, not investment advice."
+        "A trade stays open, overnight if needed, until it reaches its stop or target. "
+        "Screening output is informational, not investment advice."
     )
 
 
@@ -1378,9 +1398,10 @@ with track_tab:
         st.divider()
         st.subheader("Large-Cap Day-Trade Alerts")
         st.caption(
-            "Every large-cap day-trade breakout sent to Telegram, played forward at the close through the rest of the "
-            "session's 5-minute bars from the alert price: out at the stop or the target, whichever came first (the stop "
-            "when one bar reached both), otherwise at the close. Results are in R."
+            "Every large-cap day-trade breakout sent to Telegram, replayed each evening from the alert price through the "
+            "regular-session bars since: a trade closes only at its stop or its target, whichever came first (the stop when "
+            "one bar reached both, the bar's open when it gapped through), and stays open across days until then. "
+            "Close R is what it would have made flat at the alert day's close (the old rule). Results are in R."
         )
         if daytrade_log_error is not None:
             st.error(f"Day-trade alerts unavailable: {daytrade_log_error}")
@@ -1388,15 +1409,21 @@ with track_tab:
             st.info("No day-trade alerts sent yet. They start with the next market session.")
         elif daytrade_log is not None:
             dt_summary = summarize_daytrades(daytrade_log)
-            dt1, dt2, dt3, dt4 = st.columns(4)
-            dt1.metric("Alerts", len(daytrade_log))
-            dt2.metric("Win Rate", f"{dt_summary['win_rate_pct']}%" if dt_summary["trades"] else "N/A")
-            dt3.metric("Average R", f"{dt_summary['average_r']:+.2f}R" if dt_summary["trades"] else "N/A")
-            dt4.metric("Total R", f"{dt_summary['total_r']:+.1f}R" if dt_summary["trades"] else "N/A")
+            dt1, dt2, dt3, dt4, dt5 = st.columns(5)
+            dt1.metric("Closed", dt_summary["trades"])
+            dt2.metric("Open", dt_summary["open"], help=f"Marked at {dt_summary['open_r']:+.2f}R in total at the last close.")
+            dt3.metric("Win Rate", f"{dt_summary['win_rate_pct']}%" if dt_summary["trades"] else "N/A")
+            dt4.metric("Average R", f"{dt_summary['average_r']:+.2f}R" if dt_summary["trades"] else "N/A")
+            dt5.metric("Total R", f"{dt_summary['total_r']:+.1f}R" if dt_summary["trades"] else "N/A")
             if dt_summary["trades"]:
+                held = f", held {dt_summary['average_days']} trading days on average" if dt_summary.get("average_days") is not None else ""
+                old_rule = (
+                    f" The same trades flat at the alert day's close: {dt_summary['close_rule_total_r']:+.1f}R."
+                    if dt_summary.get("close_rule_total_r") is not None else ""
+                )
                 st.caption(
-                    f"{dt_summary['trades']} scored: {dt_summary['target_pct']}% hit target, {dt_summary['stop_pct']}% stopped out, "
-                    "the rest closed at the bell. Fewer than 30 trades is still mostly noise."
+                    f"{dt_summary['trades']} closed: {dt_summary['target_pct']}% at target, {dt_summary['stop_pct']}% stopped out"
+                    f"{held}.{old_rule} Fewer than 30 closed trades is still mostly noise."
                 )
             st.dataframe(
                 daytrade_log.sort_values(["Date", "Time"], ascending=False), hide_index=True, width="stretch",
@@ -1407,10 +1434,30 @@ with track_tab:
                     "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
                     "RVOL": st.column_config.NumberColumn("RVOL", format="%.1fx"),
                     "Day Score": st.column_config.NumberColumn("Score", format="%.0f"),
-                    "Exit": st.column_config.NumberColumn("Exit", format="$%.2f"),
+                    "Exit": st.column_config.NumberColumn("Exit / Mark", format="$%.2f", help="The mark at the last close while open."),
                     "R": st.column_config.NumberColumn("R", format="%+.2f"),
+                    "Close R": st.column_config.NumberColumn("Close R", format="%+.2f", help="Flat at the alert day's close."),
+                    "Days Held": st.column_config.NumberColumn("Days", format="%d"),
                 },
             )
+
+            feedback = build_feedback(daytrade_log)
+            st.markdown("**What the track record feeds back into new alerts**")
+            st.caption(
+                feedback_line(feedback) + " Each bucket's average R is shrunk toward the overall average as if it had "
+                "20 extra average trades, so small buckets barely count. Points are what a setup in that bucket gains or "
+                "loses on its score; a setup's buckets add up, capped at 10 points either way."
+            )
+            if not feedback["table"].empty:
+                st.dataframe(
+                    feedback["table"].drop(columns=["Shrunk R"]), hide_index=True, width="stretch",
+                    column_config={
+                        "Win Rate %": st.column_config.NumberColumn("Win Rate", format="%.0f%%"),
+                        "Average R": st.column_config.NumberColumn("Avg R", format="%+.2f"),
+                        "Edge R": st.column_config.NumberColumn("Edge vs avg", format="%+.2f"),
+                        "Points": st.column_config.NumberColumn("Points", format="%+.1f"),
+                    },
+                )
 
 with journal_tab:
     if journal_tab.open:

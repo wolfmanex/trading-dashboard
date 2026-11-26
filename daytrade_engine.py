@@ -304,22 +304,34 @@ def rank_daytrade_candidates(
     return ranked.sort_values(["Day Score", "RVOL"], ascending=False).head(limit).reset_index(drop=True)
 
 
-def evaluate_daytrade(entry: float, stop: float, target: float, bars_after: pd.DataFrame) -> dict:
-    """Play an alerted day trade forward through the rest of the session's bars.
+OPEN_TRADE = "Open"
+CLOSED_OUTCOMES = ("Target", "Stop")
 
-    Exits at the stop or the target, whichever the bars reach first (the stop when one bar spans both,
-    to stay conservative), otherwise at the last close. R is measured from the alert price.
+
+def evaluate_daytrade(entry: float, stop: float, target: float, bars_after: pd.DataFrame) -> dict:
+    """Play an alerted trade forward through the regular-session bars since the alert, across days.
+
+    The trade closes only at the stop or the target, whichever the bars reach first (the stop when one
+    bar spans both, to stay conservative). A bar that opens through a level, such as a gap the next
+    morning, fills at that bar's open. Until then the trade is "Open", marked at the last close.
+    R is measured from the alert price.
     """
     risk = entry - stop
     if risk <= 0:
-        return {"Outcome": "Invalid", "Exit": None, "R": None}
-    outcome, exit_price = "Close", entry
-    for _, bar in (bars_after if bars_after is not None else pd.DataFrame()).iterrows():
+        return {"Outcome": "Invalid", "Exit": None, "R": None, "Exit Date": None}
+    bars = bars_after if bars_after is not None else pd.DataFrame()
+    outcome, exit_price, exit_date = OPEN_TRADE, entry, None
+    for timestamp, bar in bars.iterrows():
+        bar_open = float(bar["Open"]) if "Open" in bar and pd.notna(bar["Open"]) else None
+        exit_date = timestamp.date().isoformat() if hasattr(timestamp, "date") else None
         if bar["Low"] <= stop:
-            outcome, exit_price = "Stop", stop
+            outcome, exit_price = "Stop", min(stop, bar_open) if bar_open is not None else stop
             break
         if bar["High"] >= target:
-            outcome, exit_price = "Target", target
+            outcome, exit_price = "Target", max(target, bar_open) if bar_open is not None else target
             break
         exit_price = float(bar["Close"])
-    return {"Outcome": outcome, "Exit": round(float(exit_price), 2), "R": round((exit_price - entry) / risk, 2)}
+    return {
+        "Outcome": outcome, "Exit": round(float(exit_price), 2), "R": round((exit_price - entry) / risk, 2),
+        "Exit Date": exit_date,
+    }

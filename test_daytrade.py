@@ -166,16 +166,24 @@ class DayTradeOutcomeTests(unittest.TestCase):
 
     def test_target_first(self):
         result = evaluate_daytrade(100, 99, 102, self.bars([(100.5, 99.5, 100.2), (102.1, 100.1, 102.0)]))
-        self.assertEqual(result, {"Outcome": "Target", "Exit": 102.0, "R": 2.0})
+        self.assertEqual(result, {"Outcome": "Target", "Exit": 102.0, "R": 2.0, "Exit Date": "2026-10-30"})
 
     def test_stop_wins_when_one_bar_spans_both(self):
         result = evaluate_daytrade(100, 99, 102, self.bars([(102.5, 98.5, 100.0)]))
         self.assertEqual(result["Outcome"], "Stop")
         self.assertEqual(result["R"], -1.0)
 
-    def test_closes_at_the_bell_otherwise(self):
+    def test_stays_open_until_stop_or_target(self):
         result = evaluate_daytrade(100, 99, 102, self.bars([(100.6, 99.6, 100.5)]))
-        self.assertEqual(result, {"Outcome": "Close", "Exit": 100.5, "R": 0.5})
+        self.assertEqual(result, {"Outcome": "Open", "Exit": 100.5, "R": 0.5, "Exit Date": "2026-10-30"})
+
+    def test_gap_through_the_stop_fills_at_the_open(self):
+        index = pd.DatetimeIndex(["2026-10-30 15:55", "2026-11-02 09:30"]).tz_localize(EASTERN)
+        bars = pd.DataFrame(
+            [(100.2, 100.6, 99.8, 100.1), (98.0, 98.5, 97.5, 98.2)], columns=["Open", "High", "Low", "Close"], index=index,
+        )
+        result = evaluate_daytrade(100, 99, 102, bars)
+        self.assertEqual(result, {"Outcome": "Stop", "Exit": 98.0, "R": -2.0, "Exit Date": "2026-11-02"})
 
 
 class LargeCapUniverseTests(unittest.TestCase):
@@ -293,14 +301,67 @@ class DayTradeAlertTests(unittest.TestCase):
 
         self.assertEqual(scored.loc[0, "Outcome"], "Target")
         self.assertAlmostEqual(scored.loc[0, "R"], round((104.0 - 102.3) / 1.3, 2))
+        self.assertEqual(scored.loc[0, "Exit Date"], "2026-10-30")
+        self.assertEqual(scored.loc[0, "Days Held"], 0)
         lines = daytrade_alerts.recap_lines(scored, "2026-10-30")
         self.assertIn("Target", lines[0])
         self.assertTrue(any("1 trades" in line for line in lines))
-        self.assertEqual(daytrade_alerts.recap_lines(scored, "2026-10-31"), ["No large-cap day-trade alerts today."])
+        self.assertEqual(daytrade_alerts.recap_lines(scored, "2026-10-31")[0], "No new large-cap day-trade alerts today.")
+
+    def carried_alert(self, **extra):
+        return pd.DataFrame([{
+            "Date": "2026-10-29", "Time": "10:15", "Ticker": "AAA", "Price": 102.3, "Trigger": 102.0,
+            "Stop": 101.0, "Target": 104.9, "RVOL": 3.0, "Day Score": 80, **extra,
+        }]).reindex(columns=daytrade_alerts.DAYTRADE_COLUMNS)
+
+    def two_days(self, second_day_high):
+        first = day_bars("2026-10-29", "10:15", "16:00", 102.5, 1000, high_pad=0.1, low_pad=0.1)
+        first.iloc[-1, first.columns.get_loc("Close")] = 103.0
+        second = day_bars("2026-10-30", "09:30", "16:00", 103.5, 1000, high_pad=0.1, low_pad=0.1)
+        second.iloc[10, second.columns.get_loc("High")] = second_day_high
+        return {"AAA": pd.concat([first, second])}
+
+    def test_trades_carry_over_to_the_next_day_until_target(self):
+        bars = self.two_days(second_day_high=105.0)
+        # Evening of the alert day: still open, marked at the close, with the old rule's result kept.
+        first_evening = daytrade_alerts.score_alerts(self.carried_alert(Outcome="Open"), "2026-10-29", bars)
+        self.assertEqual(first_evening.loc[0, "Outcome"], "Open")
+        self.assertEqual(first_evening.loc[0, "Exit"], 103.0)
+        self.assertAlmostEqual(first_evening.loc[0, "Close R"], round(0.7 / 1.3, 2))
+        self.assertIn("open, 103.00 at the close", daytrade_alerts.recap_lines(first_evening, "2026-10-29")[0])
+        self.assertEqual(daytrade_alerts.open_tickers(first_evening), {"AAA"})
+        # Next evening: the target is hit, a trading day later.
+        second_evening = daytrade_alerts.score_alerts(first_evening, "2026-10-30", bars)
+        self.assertEqual(second_evening.loc[0, "Outcome"], "Target")
+        self.assertEqual(second_evening.loc[0, "Exit Date"], "2026-10-30")
+        self.assertEqual(second_evening.loc[0, "Days Held"], 1)
+        lines = daytrade_alerts.recap_lines(second_evening, "2026-10-30")
+        self.assertTrue(any("from 2026-10-29: Target" in line for line in lines))
+        summary = daytrade_alerts.summarize_daytrades(second_evening)
+        self.assertEqual((summary["trades"], summary["open"], summary["target_pct"]), (1, 0, 100.0))
+
+    def test_old_close_at_the_bell_results_are_reopened(self):
+        legacy = self.carried_alert(Outcome="Close", Exit=103.0, R=0.54)
+        self.assertEqual(daytrade_alerts.summarize_daytrades(legacy)["open"], 1)
+        scored = daytrade_alerts.score_alerts(legacy, "2026-10-30", self.two_days(second_day_high=103.8))
+        self.assertEqual(scored.loc[0, "Outcome"], "Open")
+        self.assertEqual(scored.loc[0, "Close R"], 0.54)
+        self.assertEqual(scored.loc[0, "Days Held"], 1)
+        self.assertIn("Still open from earlier days (1, oldest first): AAA", "\n".join(daytrade_alerts.recap_lines(scored, "2026-10-30")))
+
+    def test_open_trade_blocks_a_new_alert_on_the_ticker(self):
+        import tempfile, os
+        now = datetime(2026, 10, 30, 10, 15, tzinfo=EASTERN)
+        sent = []
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "daytrade_alerts.csv")
+            self.carried_alert(Outcome="Open").to_csv(path, index=False)
+            daytrade_alerts.check_daytrades(path, now, lambda message: sent.append(message) or True, scan=self.results)
+        self.assertEqual(sent, [])
 
     def test_missing_alert_file_is_empty(self):
         self.assertTrue(daytrade_alerts.read_alerts("/nonexistent/daytrade_alerts.csv").empty)
-        self.assertEqual(daytrade_alerts.summarize_daytrades(daytrade_alerts.read_alerts("/nonexistent.csv")), {"trades": 0})
+        self.assertEqual(daytrade_alerts.summarize_daytrades(daytrade_alerts.read_alerts("/nonexistent.csv")), {"trades": 0, "open": 0})
 
 
 class PrivateRepoFetchTests(unittest.TestCase):
