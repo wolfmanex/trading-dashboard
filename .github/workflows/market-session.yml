@@ -19,6 +19,9 @@ permissions:
 env:
   TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
   TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  # The day-trade alerts are graded by the AI reviewer when the key is set (daytrade_alerts.grade_picks).
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
 
 jobs:
   morning:

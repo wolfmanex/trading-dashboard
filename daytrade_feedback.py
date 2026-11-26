@@ -144,3 +144,19 @@ def feedback_line(feedback: dict) -> str:
         return (f"{feedback['trades']} closed day trades; the track record starts adjusting scores at {MIN_TRADES}.")
     return (f"Scores adjusted by up to {MAX_ADJUSTMENT:.0f} points from {feedback['trades']} closed day trades "
             f"(average {feedback['average_r']:+.2f}R).")
+
+
+def feedback_summary(feedback: dict, max_rows: int = 12) -> str:
+    """Plain-text track record for the AI prompt: overall, then the buckets furthest from average."""
+    if not feedback["trades"]:
+        return ""
+    lines = [f"{feedback['trades']} closed alerts, average {feedback['average_r']:+.2f}R per trade."]
+    table = feedback["table"]
+    if not table.empty:
+        table = table.assign(distance=table["Edge R"].abs()).sort_values("distance", ascending=False).head(max_rows)
+        for _, row in table.iterrows():
+            lines.append(
+                f"- {row['Dimension']} {row['Bucket']}: {row['Trades']} trades, {row['Win Rate %']:.0f}% winners, "
+                f"{row['Average R']:+.2f}R average"
+            )
+    return "\n".join(lines)

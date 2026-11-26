@@ -41,12 +41,14 @@ from scheduled_scan import TOP_N as ALERTED_TOP_N
 from track_record_export import build_track_record_workbook
 from breakout_engine import MIN_ATR_PCT, MIN_STOP_PCT
 from daytrade_engine import (
-    MAX_BELOW_TRIGGER, MAX_EXTENSION, MAX_RISK_PCT, MIN_RISK_PCT, MIN_RVOL, OPENING_RANGE_MINUTES, TARGET_R,
+    MAX_BELOW_TRIGGER, MAX_EXTENSION, MAX_HOLD_DAYS, MAX_RISK_PCT, MAX_STOP_ATR, MIN_ATR_PCT as DAYTRADE_MIN_ATR_PCT,
+    MIN_RVOL, MIN_STOP_ATR, OPENING_RANGE_MINUTES, TARGET_R,
 )
 from daytrade_feedback import apply_feedback, build_feedback, feedback_line
 from daytrade_alerts import (
     DAYTRADE_LOG_URL, FIRST_ALERT as DAYTRADE_FIRST_ALERT, LAST_ALERT as DAYTRADE_LAST_ALERT, MIN_SCORE as DAYTRADE_MIN_SCORE,
     TOP_N as DAYTRADE_TOP_N, fetch_published_alerts, summarize_daytrades,
+    MAX_ALERTS_PER_DAY as DAYTRADE_MAX_PER_DAY, SPY_BLOCK_CHANGE,
 )
 from largecap_scanner import (
     MAX_UNIVERSE as LARGECAP_UNIVERSE, MIN_DOLLAR_VOLUME as LARGECAP_MIN_DOLLAR_VOLUME,
@@ -409,8 +411,9 @@ def render_daytrade_scanner() -> None:
             f"at least {LARGECAP_MIN_DOLLAR_VOLUME / 1e6:,.0f}M USD traded a day, on 5-minute bars. The trigger is the "
             f"{OPENING_RANGE_MINUTES}-minute opening-range high (the pre-market high before the open). Listed: within "
             f"{MAX_BELOW_TRIGGER:.0%} under the trigger or up to {MAX_EXTENSION:.1%} through it, above VWAP, on at least "
-            f"{MIN_RVOL:.1f}x the usual volume for this time of day. Stops sit under the tighter of the opening-range "
-            f"low and VWAP, {MIN_RISK_PCT:.0%}-{MAX_RISK_PCT:.0%} below the trigger; targets are {TARGET_R:.0f}R."
+            f"{MIN_RVOL:.1f}x the usual volume for this time of day, with an average daily range (ATR) of at least "
+            f"{DAYTRADE_MIN_ATR_PCT:.1%}. Risk is measured from the entry. Stops sit under the tighter of the opening-range low and "
+            f"VWAP, {MIN_STOP_ATR:g}-{MAX_STOP_ATR:g} ATR below the entry (at most {MAX_RISK_PCT:.0%}); targets are {TARGET_R:.0f}R."
         )
     with button_col:
         if st.button("Run Day-Trade Scan", width="stretch"):
@@ -472,7 +475,8 @@ def render_daytrade_scanner() -> None:
     view["Market Cap"] = view["Market Cap"].apply(lambda value: value / 1e9 if isinstance(value, (int, float)) else None)
     view["Dollar Volume"] = view["Dollar Volume"] / 1e6
     sizes = [
-        position_size(account_size, risk_pct * size_factor, row["Trigger"], row["Stop"]) for _, row in view.iterrows()
+        position_size(account_size, risk_pct * size_factor, max(row["Price"], row["Trigger"]), row["Stop"])
+        for _, row in view.iterrows()
     ]
     view["Shares"] = [size["shares"] if size else None for size in sizes]
     view["Position"] = [size["position_value"] if size else None for size in sizes]
@@ -494,6 +498,7 @@ def render_daytrade_scanner() -> None:
             "Stop": st.column_config.NumberColumn("Stop", format="$%.2f"),
             "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
             "Risk %": st.column_config.NumberColumn("Risk", format="%.2f%%"),
+            "ATR %": st.column_config.NumberColumn("ATR", format="%.2f%%", help="Average daily range over the prior sessions."),
             "RVOL": st.column_config.NumberColumn("RVOL", format="%.2fx", help="Volume so far vs the prior days at this time."),
             "VWAP": st.column_config.NumberColumn("VWAP", format="$%.2f"),
             "OR High": st.column_config.NumberColumn("OR High", format="$%.2f"),
@@ -508,17 +513,19 @@ def render_daytrade_scanner() -> None:
             "History Note": st.column_config.TextColumn("Track record", help="The bucket that moved the score most."),
             "Shares": st.column_config.NumberColumn(
                 "Shares", format="%d",
-                help=f"Entry at the trigger, sized to risk {risk_pct * size_factor:.2f}% of a {account_size:,.0f} USD account.",
+                help=f"Entry at the price (or the trigger if not through it yet), sized to risk {risk_pct * size_factor:.2f}% of a {account_size:,.0f} USD account.",
             ),
             "Position": st.column_config.NumberColumn("Position", format="$%.0f"),
             "Earnings": st.column_config.TextColumn("Earnings"),
         },
     )
     st.caption(
-        f"Shares risk {risk_pct * size_factor:.2f}% of a {account_size:,.0f} USD account from trigger to stop{size_note}. "
+        f"Shares risk {risk_pct * size_factor:.2f}% of a {account_size:,.0f} USD account from entry to stop{size_note}. "
         f"During the session the top {DAYTRADE_TOP_N} breakouts scoring {DAYTRADE_MIN_SCORE:.0f}+ are sent to Telegram "
         f"({DAYTRADE_FIRST_ALERT:%H:%M}-{DAYTRADE_LAST_ALERT:%H:%M} New York) and scored at the close in the Track Record tab. "
-        "A trade stays open, overnight if needed, until it reaches its stop or target. "
+        f"At most {DAYTRADE_MAX_PER_DAY} alerts a day, none while SPY is down {abs(SPY_BLOCK_CHANGE):.1f}% or more, a higher bar while "
+        "SPY is under its VWAP, and an AI grade of C drops a setup when the AI key is set. A trade stays open, overnight "
+        f"if needed, until its stop or target, or the close after {MAX_HOLD_DAYS} trading days. "
         "Screening output is informational, not investment advice."
     )
 
@@ -1399,8 +1406,9 @@ with track_tab:
         st.subheader("Large-Cap Day-Trade Alerts")
         st.caption(
             "Every large-cap day-trade breakout sent to Telegram, replayed each evening from the alert price through the "
-            "regular-session bars since: a trade closes only at its stop or its target, whichever came first (the stop when "
-            "one bar reached both, the bar's open when it gapped through), and stays open across days until then. "
+            "regular-session bars since: a trade closes at its stop or its target, whichever came first (the stop when "
+            "one bar reached both, the bar's open when it gapped through), and stays open across days until then, or "
+            f"until the close {MAX_HOLD_DAYS} trading days after the alert (Time). "
             "Close R is what it would have made flat at the alert day's close (the old rule). Results are in R."
         )
         if daytrade_log_error is not None:
@@ -1422,7 +1430,8 @@ with track_tab:
                     if dt_summary.get("close_rule_total_r") is not None else ""
                 )
                 st.caption(
-                    f"{dt_summary['trades']} closed: {dt_summary['target_pct']}% at target, {dt_summary['stop_pct']}% stopped out"
+                    f"{dt_summary['trades']} closed: {dt_summary['target_pct']}% at target, {dt_summary['stop_pct']}% stopped out, "
+                    f"{dt_summary['time_pct']}% out on time"
                     f"{held}.{old_rule} Fewer than 30 closed trades is still mostly noise."
                 )
             st.dataframe(

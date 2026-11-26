@@ -27,11 +27,11 @@ def day_bars(day: str, start: str, end: str, price: float, volume: float, high_p
 
 
 def history(today_regular=None, today_premarket=None, prior_price=100.0, prior_volume=10_000.0):
-    """Two quiet prior days (100 +/- 0.2, so the prior high is 100.2), then today's bars."""
+    """Two prior days (100 +/- 1, so the prior high is 101 and the daily range 2%), then today's bars."""
     frames = []
     for day in ("2026-10-28", "2026-10-29"):
         frames.append(day_bars(day, "04:00", "09:30", prior_price, prior_volume / 10))
-        frames.append(day_bars(day, "09:30", "16:00", prior_price, prior_volume))
+        frames.append(day_bars(day, "09:30", "16:00", prior_price, prior_volume, high_pad=1.0, low_pad=1.0))
     if today_premarket is not None:
         frames.append(today_premarket)
     if today_regular is not None:
@@ -81,11 +81,15 @@ class DayTradeSetupTests(unittest.TestCase):
         self.assertTrue(setup["above_prior_high"])
         self.assertAlmostEqual(setup["change_pct"], 2.3)
         self.assertAlmostEqual(setup["relative_strength"], 1.8)
-        # VWAP (~101.9) is the tighter stop candidate but sits within 0.5% of the trigger, so the
-        # opening-range low is used instead; risk stays inside the allowed band.
+        # Risk and target are measured from the entry (the price, already through the trigger). The
+        # daily range is 2 (2%), so the stop sits 1-2 under the entry: VWAP (~101.9) is too close and
+        # the opening-range low (101.0) is 1.3 under it.
+        self.assertAlmostEqual(setup["entry"], 102.3)
+        self.assertAlmostEqual(setup["atr_pct"], 2.0 / 102.3)
+        self.assertAlmostEqual(setup["stop"], 101.0)
+        self.assertAlmostEqual(setup["target"], 102.3 + 2 * 1.3)
         self.assertGreaterEqual(setup["risk_pct"], MIN_RISK_PCT - 1e-9)
         self.assertLessEqual(setup["risk_pct"], MAX_RISK_PCT + 1e-9)
-        self.assertAlmostEqual(setup["target"], setup["trigger"] + 2 * (setup["trigger"] - setup["stop"]))
 
     def test_opening_range_length_is_configurable(self):
         bars = breakout_day()
@@ -112,11 +116,17 @@ class DayTradeSetupTests(unittest.TestCase):
         self.assertIsNone(setup["vwap"])
         self.assertTrue(setup["above_vwap"])
 
-    def test_stop_is_capped_at_max_risk(self):
+    def test_stop_is_capped_at_one_daily_range(self):
         opening = day_bars("2026-10-30", "09:30", "10:00", 100.0, 40_000, high_pad=5.0, low_pad=5.0)
         later = day_bars("2026-10-30", "10:00", "10:15", 104.8, 40_000, high_pad=0.1, low_pad=0.1)
         setup = analyze_daytrade_setup(history(pd.concat([opening, later])))
-        self.assertAlmostEqual(setup["stop"], setup["trigger"] * (1 - MAX_RISK_PCT))
+        # Entry is the 105 trigger (not through it yet); the opening-range low is 10 under it, the
+        # daily range is 2, so the stop is a full range under the entry.
+        self.assertAlmostEqual(setup["stop"], 105.0 - 2.0)
+
+    def test_quiet_stocks_do_not_qualify(self):
+        self.assertFalse(qualifies_daytrade(make_setup(atr_pct=0.01), 1.5, 100e6))
+        self.assertTrue(qualifies_daytrade(make_setup(atr_pct=0.02), 1.5, 100e6))
 
     def test_needs_a_prior_session(self):
         today = day_bars("2026-10-30", "09:30", "10:30", 100.0, 10_000)
@@ -148,7 +158,7 @@ class DayTradeRankingTests(unittest.TestCase):
     def test_rank_orders_by_score_and_drops_unqualified(self):
         setups = {
             "AAA": make_setup(),
-            "BBB": make_setup(rvol=1.8, relative_strength=-1.0),
+            "BBB": make_setup(rvol=2.2, relative_strength=-1.0),
             "CCC": make_setup(rvol=1.0),
             "DDD": None,
         }
@@ -392,3 +402,88 @@ class PrivateRepoFetchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DayTradeRuleTests(unittest.TestCase):
+    """Time stop, market filter, daily cap and AI grading (2026-11-26 review changes)."""
+
+    def bars_over(self, days, price=100.5):
+        index = pd.DatetimeIndex([f"{day} 10:00" for day in days]).tz_localize(EASTERN)
+        return pd.DataFrame({"Open": price, "High": price + 0.2, "Low": price - 0.2, "Close": price}, index=index)
+
+    def test_time_stop_after_five_trading_days(self):
+        days = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09", "2026-11-10"]
+        bars = self.bars_over(days)
+        bars.iloc[-1, bars.columns.get_loc("High")] = 110   # would hit target on day 6, too late
+        result = evaluate_daytrade(100, 99, 102, bars)
+        self.assertEqual(result, {"Outcome": "Time", "Exit": 100.5, "R": 0.5, "Exit Date": "2026-11-09"})
+        self.assertEqual(evaluate_daytrade(100, 99, 102, bars.iloc[:6])["Outcome"], "Open")
+
+    def test_recap_closes_on_time_at_the_fifth_close(self):
+        days = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09"]
+        frames = [day_bars(day, "09:30", "16:00", 100.5, 1000, high_pad=0.1, low_pad=0.1) for day in days]
+        alert = pd.DataFrame([{"Date": "2026-11-02", "Time": "10:00", "Ticker": "AAA", "Price": 100.0, "Stop": 99.0,
+                               "Target": 102.0, "Outcome": "Open"}]).reindex(columns=daytrade_alerts.DAYTRADE_COLUMNS)
+        scored = daytrade_alerts.score_alerts(alert, "2026-11-09", {"AAA": pd.concat(frames)})
+        self.assertEqual(scored.loc[0, "Outcome"], "Time")
+        self.assertEqual(scored.loc[0, "Days Held"], 5)
+        self.assertEqual(scored.loc[0, "Exit Date"], "2026-11-09")
+        self.assertEqual(daytrade_alerts.open_tickers(scored), set())
+
+    def test_market_gate(self):
+        self.assertEqual(daytrade_alerts.market_gate(0.2, 0.1), (daytrade_alerts.MIN_SCORE, ""))
+        self.assertIsNone(daytrade_alerts.market_gate(-0.6, 0.1)[0])
+        self.assertEqual(daytrade_alerts.market_gate(0.0, -0.2)[0], daytrade_alerts.MIN_SCORE + 10)
+        self.assertEqual(daytrade_alerts.market_gate(None, None)[0], daytrade_alerts.MIN_SCORE)
+
+    def scan(self, spy_change=0.4, vwap_gap=0.2):
+        ranked = rank_daytrade_candidates({ticker: make_setup() for ticker in ["AAA", "BBB", "CCC", "DDD"]})
+        ranked.attrs.update({"analyzed": 4, "benchmark_change": spy_change, "benchmark_vwap_gap": vwap_gap})
+        return lambda: ranked
+
+    def run_check(self, existing=None, scan=None, grade=lambda picks, feedback, note: picks):
+        import os, tempfile
+        sent = []
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "daytrade_alerts.csv")
+            if existing is not None:
+                existing.to_csv(path, index=False)
+            daytrade_alerts.check_daytrades(
+                path, datetime(2026, 10, 30, 11, 0, tzinfo=EASTERN), lambda message: sent.append(message) or True,
+                scan=scan or self.scan(), grade=grade,
+            )
+            return sent, daytrade_alerts.read_alerts(path)
+
+    def test_weak_market_blocks_new_alerts(self):
+        sent, saved = self.run_check(scan=self.scan(spy_change=-0.8))
+        self.assertEqual((sent, len(saved)), ([], 0))
+
+    def test_daily_cap(self):
+        earlier = pd.DataFrame([
+            {"Date": "2026-10-30", "Time": "10:00", "Ticker": f"T{i}", "Outcome": "Target", "R": 1.0}
+            for i in range(daytrade_alerts.MAX_ALERTS_PER_DAY - 2)
+        ]).reindex(columns=daytrade_alerts.DAYTRADE_COLUMNS)
+        sent, saved = self.run_check(existing=earlier)
+        self.assertEqual(len(saved), daytrade_alerts.MAX_ALERTS_PER_DAY)   # only 2 more today
+        self.assertEqual(self.run_check(existing=saved)[0], [])
+
+    def test_ai_grade_c_is_dropped_and_grades_are_logged(self):
+        def grade(picks, feedback, note):
+            self.assertIn("SPY +0.40%", note)
+            return [{**pick, "AI Grade": "A", "AI Reason": "Clean"} for pick in picks if pick["Ticker"] != "AAA"]
+        sent, saved = self.run_check(grade=grade)
+        self.assertNotIn("AAA", list(saved["Ticker"]))
+        self.assertEqual(set(saved["AI Grade"]), {"A"})
+        self.assertIn("AI A: Clean", sent[0])
+
+    def test_grade_picks_drops_c_and_survives_ai_failure(self):
+        picks = [{"Ticker": "AAA"}, {"Ticker": "BBB"}]
+        feedback = {"trades": 0, "table": pd.DataFrame()}
+        with mock.patch("llm_engine.is_ai_configured", return_value=True), \
+                mock.patch("llm_engine.generate_json", return_value={"reviews": [
+                    {"ticker": "AAA", "grade": "C", "reason": "Weak record"}, {"ticker": "BBB", "grade": "B", "reason": "Ok"}]}):
+            graded = daytrade_alerts.grade_picks(picks, feedback, "")
+        self.assertEqual([(p["Ticker"], p["AI Grade"]) for p in graded], [("BBB", "B")])
+        with mock.patch("llm_engine.is_ai_configured", return_value=True), \
+                mock.patch("llm_engine.generate_json", side_effect=RuntimeError("quota")):
+            self.assertEqual(daytrade_alerts.grade_picks(picks, feedback, ""), picks)

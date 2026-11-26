@@ -22,8 +22,10 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from daytrade_engine import BREAKING_OUT, CLOSED_OUTCOMES, OPEN_TRADE, evaluate_daytrade, split_sessions
-from daytrade_feedback import apply_feedback, build_feedback
+from daytrade_engine import (
+    BREAKING_OUT, CLOSED_OUTCOMES, MAX_HOLD_DAYS, OPEN_TRADE, TIME_EXIT, evaluate_daytrade, split_sessions,
+)
+from daytrade_feedback import apply_feedback, build_feedback, feedback_summary
 from market_calendar import is_trading_day
 from signal_log import GITHUB_REPO, LOG_BRANCH, fetch_branch_file
 from smallcap_screener import _ticker_frame
@@ -34,6 +36,11 @@ FIRST_ALERT = time(10, 0)   # once the 30-minute opening range is in
 LAST_ALERT = time(15, 30)   # too little session left to work a trade after this
 TOP_N = 5
 MIN_SCORE = 60.0
+MAX_ALERTS_PER_DAY = 6       # 2-25 Nov 2026 sent up to 42 a day; the later ones didn't add anything
+# Market filter: no new longs when SPY is down this much on the day, and a higher bar while it trades
+# under its VWAP (20 Nov 2026, a weak market day, cost three quarters of the month's losses).
+SPY_BLOCK_CHANGE = -0.5
+SPY_UNDER_VWAP_EXTRA_SCORE = 10.0
 MAX_OPEN_LISTED = 12   # carried-over open trades named in the recap; the rest are counted
 DAYTRADE_COLUMNS = [
     "Date", "Time", "Ticker", "Price", "Trigger", "Stop", "Target", "RVOL", "Day Score",
@@ -41,7 +48,7 @@ DAYTRADE_COLUMNS = [
     # Added with trades that carry over: when it closed, the result had it been flattened at the alert
     # day's close, and what was known at the alert (for the feedback loop).
     "Exit Date", "Days Held", "Close R", "Trigger Level", "Risk %", "Change %", "RS vs SPY", "SPY %",
-    "History Adj", "Adj Score",
+    "History Adj", "Adj Score", "ATR %", "AI Grade", "AI Reason",
 ]
 LEGACY_CLOSE = "Close"   # the old rule's flat-at-the-bell outcome; such trades are reopened and replayed
 
@@ -105,33 +112,80 @@ def format_alerts(picks: list, now: datetime, benchmark_change=None) -> str:
         adjustment = pick.get("History Adj")
         if isinstance(adjustment, (int, float)) and abs(adjustment) >= 0.5:
             score += f" ({adjustment:+.0f} from track record: {escape(str(pick.get('History Note') or ''))})"
+        if pick.get("AI Grade"):
+            score += f" | AI {escape(str(pick['AI Grade']))}: {escape(str(pick.get('AI Reason') or ''))}"
         lines.append(
             f"<b>{escape(str(pick['Ticker']))}</b> {pick['Price']:.2f} over {escape(str(pick['Trigger Level']).lower())} "
             f"{pick['Trigger']:.2f} on {pick['RVOL']:.1f}x volume | stop {pick['Stop']:.2f} "
             f"target {pick['Target']:.2f} | {score}"
         )
-    lines.append("Held until the stop or the target is hit, overnight if needed.")
+    lines.append(f"Held until the stop or the target, overnight if needed; out at the close after {MAX_HOLD_DAYS} days otherwise.")
     return "\n".join(lines)
 
 
-def check_daytrades(sent_path: str, now: datetime, notify, scan=None) -> None:
+def market_gate(spy_change, spy_vwap_gap) -> tuple:
+    """(minimum score, reason) for new alerts given SPY; a minimum of None means no new alerts."""
+    if isinstance(spy_change, (int, float)) and spy_change <= SPY_BLOCK_CHANGE:
+        return None, f"SPY {spy_change:+.2f}% on the day, no new long alerts"
+    if isinstance(spy_vwap_gap, (int, float)) and spy_vwap_gap < 0:
+        return MIN_SCORE + SPY_UNDER_VWAP_EXTRA_SCORE, f"SPY under its VWAP, alerts need {MIN_SCORE + SPY_UNDER_VWAP_EXTRA_SCORE:.0f}+"
+    return MIN_SCORE, ""
+
+
+def grade_picks(picks: list, feedback: dict, market_note: str) -> list:
+    """Add the AI grade to the picks and drop the ones it grades C; ungraded picks pass when AI fails."""
+    from llm_engine import is_ai_configured, review_daytrade_candidates
+    if not picks or not is_ai_configured():
+        return picks
+    outcome = review_daytrade_candidates(picks, feedback_summary(feedback), market_note)
+    if outcome["error"]:
+        print(f"AI day-trade grading failed, alerting ungraded: {outcome['error']}")
+        return picks
+    graded = []
+    for pick in picks:
+        review = outcome["reviews"].get(str(pick["Ticker"]).upper())
+        if review:
+            pick = {**pick, "AI Grade": review["grade"], "AI Reason": review["reason"]}
+        if pick.get("AI Grade") == "C":
+            print(f"AI graded {pick['Ticker']} C, not alerted: {pick.get('AI Reason')}")
+            continue
+        graded.append(pick)
+    return graded
+
+
+def check_daytrades(sent_path: str, now: datetime, notify, scan=None, grade=grade_picks) -> None:
     if scan is None:
         from largecap_scanner import scan_daytrade_setups as scan
     sent = read_alerts(sent_path)
-    already = set(sent.loc[sent["Date"] == now.date().isoformat(), "Ticker"]) | open_tickers(sent)
+    today = now.date().isoformat()
+    sent_today = sent.loc[sent["Date"] == today, "Ticker"]
+    remaining = MAX_ALERTS_PER_DAY - len(sent_today)
+    if remaining <= 0:
+        print(f"Already sent {len(sent_today)} day-trade alerts today (cap {MAX_ALERTS_PER_DAY}); nothing to do.")
+        return
+    already = set(sent_today) | open_tickers(sent)
     results = scan()
     spy_change = results.attrs.get("benchmark_change")
+    min_score, market_reason = market_gate(spy_change, results.attrs.get("benchmark_vwap_gap"))
+    if min_score is None:
+        print(f"Market filter at {now:%H:%M}: {market_reason}.")
+        return
     feedback = build_feedback(sent)
     attrs = dict(results.attrs)
     results = apply_feedback(results, feedback, now_minute=now.hour * 60 + now.minute, spy_change=spy_change)
     results.attrs.update(attrs)
-    picks = pick_alerts(results, already)
+    picks = pick_alerts(results, already, top_n=min(TOP_N, remaining), min_score=min_score)
+    market_note = f"SPY {spy_change:+.2f}% on the day" if isinstance(spy_change, (int, float)) else ""
+    if market_reason:
+        market_note += f"; {market_reason}"
+    picks = grade(picks, feedback, market_note)
     print(f"Scanned {results.attrs.get('analyzed', 'N/A')} large caps at {now:%H:%M}: "
           f"{len(results)} setups, {len(picks)} new breakouts to alert "
-          f"(track record: {feedback['trades']} closed trades{', adjusting scores' if feedback['active'] else ''}).")
+          f"(track record: {feedback['trades']} closed trades{', adjusting scores' if feedback['active'] else ''}"
+          f"{'; ' + market_reason if market_reason else ''}).")
     if picks and notify(format_alerts(picks, now, spy_change)):
         rows = pd.DataFrame([
-            {**pick, "Date": now.date().isoformat(), "Time": now.strftime("%H:%M"), "Outcome": OPEN_TRADE, "SPY %": spy_change}
+            {**pick, "Date": today, "Time": now.strftime("%H:%M"), "Outcome": OPEN_TRADE, "SPY %": spy_change}
             for pick in picks
         ])
         rows = rows.reindex(columns=DAYTRADE_COLUMNS)
@@ -196,11 +250,14 @@ def score_alerts(alerts: pd.DataFrame, today: str, bars_by_ticker) -> pd.DataFra
             same_day = regular[after & (dates == alert_day)]
             alerts.loc[index, "Close R"] = evaluate_daytrade(float(row["Price"]), float(row["Stop"]), float(row["Target"]), same_day)["R"]
         last_day = result["Exit Date"] or alert_day
+        days_held = _trading_days_between(alert_day, last_day)
+        if result["Outcome"] == OPEN_TRADE and days_held >= MAX_HOLD_DAYS and last_day == today:
+            result["Outcome"] = TIME_EXIT   # the holding period ended at today's close
         alerts.loc[index, "Outcome"] = result["Outcome"]
         alerts.loc[index, "Exit"] = result["Exit"]
         alerts.loc[index, "R"] = result["R"]
         alerts.loc[index, "Exit Date"] = last_day if result["Outcome"] in CLOSED_OUTCOMES else None
-        alerts.loc[index, "Days Held"] = _trading_days_between(alert_day, last_day)
+        alerts.loc[index, "Days Held"] = days_held
     return alerts
 
 
@@ -228,6 +285,7 @@ def summarize_daytrades(alerts: pd.DataFrame) -> dict:
         "total_r": round(float(r[closed].sum()), 2),
         "target_pct": round(float((alerts.loc[closed, "Outcome"] == "Target").mean() * 100), 1),
         "stop_pct": round(float((alerts.loc[closed, "Outcome"] == "Stop").mean() * 100), 1),
+        "time_pct": round(float((alerts.loc[closed, "Outcome"] == TIME_EXIT).mean() * 100), 1),
         "average_days": round(float(days.mean()), 1) if days.notna().any() else None,
         "close_rule_total_r": round(float(close_r.sum()), 2) if close_r.notna().any() else None,
     })

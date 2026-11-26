@@ -462,3 +462,77 @@ Output strictly one JSON object, with one review per candidate, matching this sc
     except Exception as e:
         print(f"Breakout Review Engine Error: {e}")
         return {"reviews": {}, "error": str(e)}
+
+
+DAYTRADE_GRADES = {"A", "B", "C"}
+
+
+def validate_daytrade_reviews(result: dict, candidate_tickers) -> dict:
+    """Keep well-formed day-trade grades for tickers that were sent: {ticker: {"grade", "reason"}}."""
+    if not isinstance(result, dict) or not isinstance(result.get("reviews"), list):
+        raise ValueError("AI day-trade response must contain a 'reviews' list")
+    allowed = {str(ticker).upper() for ticker in candidate_tickers}
+    reviews = {}
+    for review in result["reviews"]:
+        if not isinstance(review, dict):
+            continue
+        ticker = str(review.get("ticker", "")).strip().upper()
+        grade = str(review.get("grade", "")).strip().upper()
+        if ticker in allowed and grade in DAYTRADE_GRADES:
+            reviews[ticker] = {"grade": grade, "reason": sanitize_headline(str(review.get("reason", "")), 200)}
+    return reviews
+
+
+def format_daytrade_candidate(pick: dict) -> str:
+    def value(key, digits=2):
+        number = pick.get(key)
+        return f"{float(number):.{digits}f}" if isinstance(number, (int, float)) and pd.notna(number) else "N/A"
+
+    return (
+        f"- {pick['Ticker']} ({sanitize_headline(str(pick.get('Name', '')), 60)}): price {value('Price')} USD through the "
+        f"{str(pick.get('Trigger Level', '')).lower()} {value('Trigger')} | stop {value('Stop')} | target {value('Target')} | "
+        f"risk {value('Risk %')}% | daily range {value('ATR %')}% | RVOL {value('RVOL', 1)}x | day change {value('Change %')}% | "
+        f"vs SPY {value('RS vs SPY')}% | day score {value('Day Score', 0)} | track-record adjustment {value('History Adj', 0)} points"
+    )
+
+
+def review_daytrade_candidates(picks: list, track_record: str, market_note: str = "") -> dict:
+    """Grade intraday large-cap breakouts about to be alerted, with the alerts' own track record in view.
+
+    Returns {"reviews": {ticker: {"grade", "reason"}}, "error": str | None}.
+    """
+    if not picks:
+        return {"reviews": {}, "error": None}
+    candidates = "\n".join(format_daytrade_candidate(pick) for pick in picks)
+    prompt = f"""
+You are an intraday trader reviewing large-cap US stock breakouts that a screener found on 5-minute bars.
+Levels were computed in code from price data; do not recompute or invent them. A trade is held until it
+reaches its stop or its target (up to five trading days), so judge whether each setup is likely to reach
+the target before the stop.
+
+Use the track record of earlier alerts from this same screener below: buckets that lost money are a
+warning, buckets that made money are support, but weigh how many trades each bucket has. Fewer than about
+20 trades is weak evidence. Also judge the market backdrop and whether the stock's daily range makes the
+target realistic.
+
+Grades: A = strong setup, supported by the record and the market; B = acceptable; C = skip it (weak
+record for this kind of setup, hostile market, or a target the stock rarely reaches).
+Give one short sentence of reason. Never use the '$' symbol.
+
+### MARKET
+{market_note or "Market conditions unavailable."}
+
+### TRACK RECORD OF EARLIER ALERTS
+{track_record or "No closed trades yet."}
+
+### CANDIDATES
+{candidates}
+
+Output strictly one JSON object:
+{{"reviews": [{{"ticker": "ABCD", "grade": "B", "reason": "One sentence."}}]}}
+"""
+    try:
+        return {"reviews": validate_daytrade_reviews(generate_json(prompt), [p["Ticker"] for p in picks]), "error": None}
+    except Exception as e:
+        print(f"Day-trade Review Engine Error: {e}")
+        return {"reviews": {}, "error": str(e)}

@@ -4,7 +4,7 @@ import unittest
 import pandas as pd
 
 from daytrade_alerts import BREAKING_OUT, pick_alerts
-from daytrade_feedback import MAX_ADJUSTMENT, MIN_TRADES, apply_feedback, build_feedback, feedback_line
+from daytrade_feedback import MAX_ADJUSTMENT, MIN_TRADES, apply_feedback, build_feedback, feedback_line, feedback_summary
 
 
 def history(early_r: float, late_r: float, per_bucket: int) -> pd.DataFrame:
@@ -61,6 +61,13 @@ class FeedbackTests(unittest.TestCase):
         closed.iloc[-1, closed.columns.get_loc("RVOL")] = 6.0
         table = build_feedback(closed)["table"].set_index(["Dimension", "Bucket"])
         self.assertGreater(table.loc[("Relative volume", "3x and up"), "Edge R"], -0.05)
+
+    def test_summary_for_the_ai_prompt_leads_with_the_strongest_buckets(self):
+        summary = feedback_summary(build_feedback(history(-1.0, 1.0, per_bucket=30)))
+        lines = summary.splitlines()
+        self.assertEqual(lines[0], "60 closed alerts, average +0.00R per trade.")
+        self.assertIn("Time of day", lines[1])
+        self.assertEqual(feedback_summary(build_feedback(pd.DataFrame())), "")
 
     def test_open_and_old_close_rows_are_not_counted(self):
         closed = history(1.0, 1.0, per_bucket=1)

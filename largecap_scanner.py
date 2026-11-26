@@ -11,7 +11,10 @@ import streamlit as st
 import yfinance as yf
 from yfinance import EquityQuery
 
-from daytrade_engine import MIN_RVOL, OPENING_RANGE_MINUTES, analyze_daytrade_setup, day_change_pct, rank_daytrade_candidates
+from daytrade_engine import (
+    MIN_RVOL, OPENING_RANGE_MINUTES, analyze_daytrade_setup, day_change_pct, rank_daytrade_candidates, session_vwap,
+    split_sessions,
+)
 from smallcap_screener import (
     US_EXCHANGES, _ticker_frame, fetch_nasdaq_screener, first_universe, parse_nasdaq_rows, parse_screener_quotes,
 )
@@ -120,6 +123,13 @@ def scan_daytrade_setups(
 
     benchmark_bars = _ticker_frame(batch, BENCHMARK)
     benchmark_change = day_change_pct(benchmark_bars)
+    benchmark_vwap_gap = None
+    benchmark_sessions = split_sessions(benchmark_bars)
+    if benchmark_sessions:
+        regular = benchmark_sessions[list(benchmark_sessions)[-1]]["regular"]
+        vwap = session_vwap(regular)
+        if vwap:
+            benchmark_vwap_gap = round((float(regular["Close"].iloc[-1]) / vwap - 1) * 100, 2)
     setups = {}
     for ticker in tickers:
         try:
@@ -142,6 +152,7 @@ def scan_daytrade_setups(
         "screener_error": screener_error,
         "phase": phases.index[0],
         "benchmark_change": round(benchmark_change, 2) if benchmark_change is not None else None,
+        "benchmark_vwap_gap": benchmark_vwap_gap,   # SPY's last price vs its session VWAP, %
     })
     return result
 
