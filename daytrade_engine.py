@@ -27,9 +27,10 @@ BAR_MINUTES = 5
 # leave stops inside normal noise.
 OPENING_RANGE_MINUTES = 30
 MAX_BELOW_TRIGGER = 0.02        # list setups up to 2% under the trigger
-# Up to 0.5% over it. Entries further through the trigger had a worse record (2-25 Nov 2026 review):
-# the risk from such an entry is far bigger than the setup's own.
-MAX_EXTENSION = 0.005
+# Up to 1% over it (was 1.5%). With risk now measured from the entry an extended entry no longer
+# shrinks the reward/risk, and in the 2-25 Nov 2026 record extension alone didn't predict losses,
+# so this stays moderate; the feedback loop's "Through trigger" buckets keep watching it.
+MAX_EXTENSION = 0.01
 MIN_RVOL = 2.0                  # under 2x lost the most in the same review
 MIN_ATR_PCT = 0.015             # defensive names with smaller daily ranges almost never reached target
 MIN_STOP_ATR = 0.5              # a stop never sits closer than half a day's average range under the entry
